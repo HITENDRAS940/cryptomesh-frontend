@@ -37,7 +37,7 @@ fun ChatScreen() {
             EmptyState(
                 icon = Icons.AutoMirrored.Filled.Chat,
                 title = "No conversations",
-                description = "Conversation list, message bubbles, and delivery states will be built in Phase 4."
+                description = "Messages with nearby peers will appear here."
             )
         }
     }

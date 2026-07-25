@@ -43,7 +43,7 @@ fun WalletScreen() {
             EmptyState(
                 icon = Icons.Default.AccountBalanceWallet,
                 title = "No transactions",
-                description = "Wallet dashboard and transaction history will be built in Phase 6."
+                description = "Balance and transaction history will appear here."
             )
         }
     }

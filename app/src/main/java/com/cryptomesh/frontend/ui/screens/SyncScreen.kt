@@ -39,7 +39,7 @@ fun SyncScreen() {
             EmptyState(
                 icon = Icons.Default.CloudOff,
                 title = "Nothing to sync",
-                description = "Sync queue, last synced time, and server results will be built in Phase 7."
+                description = "Pending messages, files, and wallet updates will appear here."
             )
         }
     }

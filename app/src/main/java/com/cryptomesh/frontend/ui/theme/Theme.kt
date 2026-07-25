@@ -5,6 +5,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Shapes
 import androidx.compose.material3.lightColorScheme
 import androidx.compose.runtime.Composable
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.unit.dp
 
 private val LightColorScheme = lightColorScheme(
@@ -14,12 +15,22 @@ private val LightColorScheme = lightColorScheme(
     onPrimaryContainer = MeshGreenDark,
     secondary = AlertAmber,
     onSecondary = Ink,
+    secondaryContainer = AmberContainer,
+    onSecondaryContainer = OnAmberContainer,
     background = Paper,
     onBackground = Ink,
     surface = Paper,
     onSurface = Ink,
+    surfaceVariant = Panel,
     surfaceContainer = Panel,
-    onSurfaceVariant = Slate
+    surfaceContainerLowest = Paper,
+    surfaceContainerLow = SoftPanel,
+    surfaceContainerHigh = Panel,
+    surfaceContainerHighest = MeshMint,
+    onSurfaceVariant = Slate,
+    outline = MeshOutline,
+    outlineVariant = MeshOutlineSoft,
+    surfaceTint = Color.Transparent
 )
 
 private val CryptoMeshShapes = Shapes(
