@@ -23,10 +23,11 @@ import androidx.compose.ui.text.input.TextFieldValue
 import androidx.compose.ui.unit.dp
 import com.cryptomesh.frontend.ui.components.ActionButton
 import com.cryptomesh.frontend.ui.components.EmptyState
-import com.cryptomesh.frontend.ui.components.SectionHeader
+import com.cryptomesh.frontend.ui.components.ScreenHeader
 
 @Composable
 fun CreateIdentityScreen(
+    onBack: () -> Unit,
     onIdentityCreated: (String) -> Unit
 ) {
     var name by rememberSaveable(stateSaver = TextFieldValue.Saver) {
@@ -40,39 +41,49 @@ fun CreateIdentityScreen(
         Column(
             modifier = Modifier
                 .fillMaxSize()
-                .padding(20.dp),
-            verticalArrangement = Arrangement.spacedBy(18.dp)
         ) {
-            SectionHeader(text = "Local Identity")
-            Text(
-                text = "This identity represents the device during peer verification and secure session setup.",
-                style = MaterialTheme.typography.bodyLarge,
-                color = MaterialTheme.colorScheme.onSurfaceVariant
+            ScreenHeader(
+                title = "Local Identity",
+                supportingText = "Create this device's secure identity",
+                onBack = onBack
             )
-            OutlinedTextField(
-                value = name,
-                onValueChange = { name = it },
-                modifier = Modifier.fillMaxWidth(),
-                label = { Text("Display name") },
-                leadingIcon = {
-                    androidx.compose.material3.Icon(
-                        imageVector = Icons.Default.Badge,
-                        contentDescription = null
-                    )
-                },
-                singleLine = true
-            )
-            ActionButton(
-                label = "Generate identity",
-                icon = Icons.Default.Check,
-                onClick = { onIdentityCreated(name.text) },
-                modifier = Modifier.fillMaxWidth()
-            )
-            EmptyState(
-                icon = Icons.Default.Badge,
-                title = "Local-only placeholder",
-                description = "Your identity stays on this device and remains available offline."
-            )
+            Column(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .padding(20.dp),
+                verticalArrangement = Arrangement.spacedBy(18.dp)
+            ) {
+                Text(
+                    text = "This identity represents the device during peer verification and secure session setup.",
+                    style = MaterialTheme.typography.bodyLarge,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                OutlinedTextField(
+                    value = name,
+                    onValueChange = { name = it },
+                    modifier = Modifier.fillMaxWidth(),
+                    label = { Text("Display name") },
+                    leadingIcon = {
+                        androidx.compose.material3.Icon(
+                            imageVector = Icons.Default.Badge,
+                            contentDescription = null
+                        )
+                    },
+                    singleLine = true
+                )
+                ActionButton(
+                    label = "Generate identity",
+                    icon = Icons.Default.Check,
+                    onClick = { onIdentityCreated(name.text) },
+                    modifier = Modifier.fillMaxWidth()
+                )
+                EmptyState(
+                    icon = Icons.Default.Badge,
+                    title = "Local-only placeholder",
+                    description =
+                        "Your identity stays on this device and remains available offline."
+                )
+            }
         }
     }
 }

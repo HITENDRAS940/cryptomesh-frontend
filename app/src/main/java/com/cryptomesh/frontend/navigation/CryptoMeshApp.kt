@@ -1,5 +1,13 @@
 package com.cryptomesh.frontend.navigation
 
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.slideInVertically
+import androidx.compose.animation.slideOutVertically
+import androidx.compose.animation.core.tween
+import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.foundation.layout.ime
 import androidx.compose.foundation.layout.padding
 import androidx.compose.material3.Icon
 import androidx.compose.material3.NavigationBar
@@ -10,6 +18,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalDensity
 import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.navigation.NavDestination.Companion.hierarchy
 import androidx.navigation.compose.NavHost
@@ -35,11 +44,24 @@ fun CryptoMeshApp() {
     val backStackEntry by navController.currentBackStackEntryAsState()
     val currentDestination = backStackEntry?.destination
     val currentRoute = currentDestination?.route
-    val showBottomBar = currentRoute in mainDestinations.map { it.route }
+    val density = LocalDensity.current
+    val isKeyboardVisible = WindowInsets.ime.getBottom(density) > 0
+    val showBottomBar = currentRoute in mainDestinations.map { it.route } &&
+        !isKeyboardVisible
 
     Scaffold(
         bottomBar = {
-            if (showBottomBar) {
+            AnimatedVisibility(
+                visible = showBottomBar,
+                enter = slideInVertically(
+                    animationSpec = tween(220),
+                    initialOffsetY = { it / 2 }
+                ) + fadeIn(animationSpec = tween(180)),
+                exit = slideOutVertically(
+                    animationSpec = tween(200),
+                    targetOffsetY = { it / 2 }
+                ) + fadeOut(animationSpec = tween(150))
+            ) {
                 NavigationBar {
                     mainDestinations.forEach { destination ->
                         val selected = currentDestination
@@ -88,6 +110,7 @@ fun CryptoMeshApp() {
             }
             composable(AppRoute.CreateIdentity.route) {
                 CreateIdentityScreen(
+                    onBack = { navController.popBackStack() },
                     onIdentityCreated = { displayName ->
                         viewModel.createIdentity(displayName)
                         navController.navigate(MainDestination.Dashboard.route) {

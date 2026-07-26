@@ -20,6 +20,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import com.cryptomesh.frontend.ui.components.ActionButton
+import com.cryptomesh.frontend.ui.components.ScreenHeader
 import com.cryptomesh.frontend.ui.components.StatusPill
 
 @Composable
@@ -30,40 +31,40 @@ fun WelcomeScreen(
         modifier = Modifier.fillMaxSize(),
         color = MaterialTheme.colorScheme.background
     ) {
-        Column(
-            modifier = Modifier
-                .fillMaxSize()
-                .padding(24.dp),
-            horizontalAlignment = Alignment.CenterHorizontally,
-            verticalArrangement = Arrangement.Center
-        ) {
-            Icon(
-                imageVector = Icons.Default.Security,
-                contentDescription = null,
-                tint = MaterialTheme.colorScheme.primary
+        Column(modifier = Modifier.fillMaxSize()) {
+            ScreenHeader(
+                title = "CryptoMesh",
+                supportingText = "Secure local communication"
             )
-            Spacer(modifier = Modifier.height(18.dp))
-            Text(
-                text = "CryptoMesh",
-                style = MaterialTheme.typography.headlineMedium,
-                textAlign = TextAlign.Center
-            )
-            Spacer(modifier = Modifier.height(8.dp))
-            Text(
-                text = "Create a local identity before connecting to nearby peers.",
-                style = MaterialTheme.typography.bodyLarge,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                textAlign = TextAlign.Center
-            )
-            Spacer(modifier = Modifier.height(22.dp))
-            StatusPill(text = "Works offline")
-            Spacer(modifier = Modifier.height(28.dp))
-            ActionButton(
-                label = "Create identity",
-                icon = Icons.AutoMirrored.Filled.ArrowForward,
-                onClick = onCreateIdentity,
-                modifier = Modifier.fillMaxWidth()
-            )
+            Column(
+                modifier = Modifier
+                    .weight(1f)
+                    .padding(24.dp),
+                horizontalAlignment = Alignment.CenterHorizontally,
+                verticalArrangement = Arrangement.Center
+            ) {
+                Icon(
+                    imageVector = Icons.Default.Security,
+                    contentDescription = null,
+                    tint = MaterialTheme.colorScheme.primary
+                )
+                Spacer(modifier = Modifier.height(18.dp))
+                Text(
+                    text = "Create a local identity before connecting to nearby peers.",
+                    style = MaterialTheme.typography.bodyLarge,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    textAlign = TextAlign.Center
+                )
+                Spacer(modifier = Modifier.height(22.dp))
+                StatusPill(text = "Works offline")
+                Spacer(modifier = Modifier.height(28.dp))
+                ActionButton(
+                    label = "Create identity",
+                    icon = Icons.AutoMirrored.Filled.ArrowForward,
+                    onClick = onCreateIdentity,
+                    modifier = Modifier.fillMaxWidth()
+                )
+            }
         }
     }
 }

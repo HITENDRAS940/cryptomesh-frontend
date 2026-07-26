@@ -63,6 +63,7 @@ import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.cryptomesh.frontend.ui.components.EmptyState
 import com.cryptomesh.frontend.ui.components.InfoRow
+import com.cryptomesh.frontend.ui.components.MainTabHeader
 import com.cryptomesh.frontend.ui.components.StatusPill
 import com.cryptomesh.frontend.ui.state.NearbyPeerUiModel
 import com.cryptomesh.frontend.ui.state.PeerConnectionStatus
@@ -136,82 +137,105 @@ private fun PeerDiscoveryContent(
         Column(
             modifier = Modifier
                 .fillMaxSize()
-                .padding(horizontal = 20.dp, vertical = 16.dp),
-            verticalArrangement = Arrangement.spacedBy(14.dp)
         ) {
-            PeerDiscoveryHeader(
-                isScanning = uiState.isScanning,
-                onStartScan = onStartScan
-            )
-            ScanControl(
-                isScanning = uiState.isScanning,
-                onStartScan = onStartScan,
-                onStopScan = onStopScan
-            )
-
-            when {
-                uiState.scanError != null -> {
-                    EmptyState(
-                        icon = Icons.Default.ErrorOutline,
-                        title = "Scan unavailable",
-                        description = uiState.scanError
-                    )
-                    OutlinedButton(
+            MainTabHeader(
+                title = "Nearby Peers",
+                supportingText = if (uiState.isScanning) {
+                    "Local scan active"
+                } else {
+                    "Bluetooth and nearby Wi-Fi"
+                },
+                trailingContent = {
+                    IconButton(
                         onClick = onStartScan,
-                        modifier = Modifier.fillMaxWidth()
+                        enabled = !uiState.isScanning
                     ) {
-                        Icon(Icons.Default.Refresh, contentDescription = null)
-                        Text(
-                            text = "Retry scan",
-                            modifier = Modifier.padding(start = 8.dp)
+                        Icon(
+                            imageVector = Icons.Default.Refresh,
+                            contentDescription = "Refresh nearby peers"
                         )
                     }
                 }
+            )
 
-                uiState.isScanning -> {
-                    EmptyState(
-                        icon = Icons.Default.Radar,
-                        title = "Looking for nearby peers",
-                        description = "Keep this device close to other CryptoMesh devices."
-                    )
-                }
+            Column(
+                modifier = Modifier
+                    .weight(1f)
+                    .fillMaxWidth()
+                    .padding(horizontal = 20.dp, vertical = 14.dp),
+                verticalArrangement = Arrangement.spacedBy(14.dp)
+            ) {
+                ScanControl(
+                    isScanning = uiState.isScanning,
+                    onStartScan = onStartScan,
+                    onStopScan = onStopScan
+                )
 
-                !uiState.hasScanned -> {
-                    EmptyState(
-                        icon = Icons.Default.Devices,
-                        title = "Ready to discover",
-                        description = "Nearby CryptoMesh devices will appear here."
-                    )
-                }
-
-                uiState.peers.isEmpty() -> {
-                    EmptyState(
-                        icon = Icons.Default.Radar,
-                        title = "No peers found",
-                        description = "Move closer to another device and scan again."
-                    )
-                }
-
-                else -> {
-                    Text(
-                        text = "${uiState.peers.size} peers nearby",
-                        style = MaterialTheme.typography.labelLarge,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                    )
-                    LazyColumn(
-                        modifier = Modifier.weight(1f),
-                        verticalArrangement = Arrangement.spacedBy(10.dp)
-                    ) {
-                        items(uiState.peers, key = { it.id }) { peer ->
-                            PeerListItem(
-                                peer = peer,
-                                onClick = { onSelectPeer(peer.id) },
-                                onConnect = { onRequestConnection(peer.id) },
-                                onRetry = { onRetryConnection(peer.id) }
+                when {
+                    uiState.scanError != null -> {
+                        EmptyState(
+                            icon = Icons.Default.ErrorOutline,
+                            title = "Scan unavailable",
+                            description = uiState.scanError
+                        )
+                        OutlinedButton(
+                            onClick = onStartScan,
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            Icon(Icons.Default.Refresh, contentDescription = null)
+                            Text(
+                                text = "Retry scan",
+                                modifier = Modifier.padding(start = 8.dp)
                             )
                         }
-                        item {
-                            Spacer(modifier = Modifier.height(4.dp))
+                    }
+
+                    uiState.isScanning -> {
+                        EmptyState(
+                            icon = Icons.Default.Radar,
+                            title = "Looking for nearby peers",
+                            description =
+                                "Keep this device close to other CryptoMesh devices."
+                        )
+                    }
+
+                    !uiState.hasScanned -> {
+                        EmptyState(
+                            icon = Icons.Default.Devices,
+                            title = "Ready to discover",
+                            description = "Nearby CryptoMesh devices will appear here."
+                        )
+                    }
+
+                    uiState.peers.isEmpty() -> {
+                        EmptyState(
+                            icon = Icons.Default.Radar,
+                            title = "No peers found",
+                            description = "Move closer to another device and scan again."
+                        )
+                    }
+
+                    else -> {
+                        Text(
+                            text = "${uiState.peers.size} peers nearby",
+                            style = MaterialTheme.typography.labelLarge,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                        LazyColumn(
+                            modifier = Modifier.weight(1f),
+                            verticalArrangement = Arrangement.spacedBy(10.dp)
+                        ) {
+                            items(uiState.peers, key = { it.id }) { peer ->
+                                PeerListItem(
+                                    peer = peer,
+                                    onClick = { onSelectPeer(peer.id) },
+                                    onConnect = { onRequestConnection(peer.id) },
+                                    onRetry = { onRetryConnection(peer.id) }
+                                )
+                            }
+                            item {
+                                Spacer(modifier = Modifier.height(4.dp))
+                            }
                         }
                     }
                 }
@@ -242,38 +266,6 @@ private fun PeerDiscoveryContent(
             onDismiss = onDismissConnectionRequest,
             onConfirm = onConfirmConnection
         )
-    }
-}
-
-@Composable
-private fun PeerDiscoveryHeader(
-    isScanning: Boolean,
-    onStartScan: () -> Unit
-) {
-    Row(
-        modifier = Modifier.fillMaxWidth(),
-        verticalAlignment = Alignment.CenterVertically
-    ) {
-        Column(modifier = Modifier.weight(1f)) {
-            Text(
-                text = "Nearby Peers",
-                style = MaterialTheme.typography.headlineSmall
-            )
-            Text(
-                text = if (isScanning) "Local scan active" else "Bluetooth and nearby Wi-Fi",
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant
-            )
-        }
-        IconButton(
-            onClick = onStartScan,
-            enabled = !isScanning
-        ) {
-            Icon(
-                imageVector = Icons.Default.Refresh,
-                contentDescription = "Refresh nearby peers"
-            )
-        }
     }
 }
 

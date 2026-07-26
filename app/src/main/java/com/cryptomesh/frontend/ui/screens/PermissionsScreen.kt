@@ -10,15 +10,15 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.Bluetooth
 import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.LocationOn
 import androidx.compose.material.icons.filled.Notifications
 import androidx.compose.material.icons.filled.Wifi
 import androidx.compose.material3.Icon
-import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
@@ -33,6 +33,7 @@ import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.unit.dp
 import com.cryptomesh.frontend.ui.components.ActionButton
 import com.cryptomesh.frontend.ui.components.InfoRow
+import com.cryptomesh.frontend.ui.components.ScreenHeader
 import com.cryptomesh.frontend.ui.components.StatusPill
 
 @Composable
@@ -57,51 +58,56 @@ fun PermissionsScreen(
         Column(
             modifier = Modifier
                 .fillMaxSize()
-                .padding(20.dp),
-            verticalArrangement = Arrangement.spacedBy(18.dp)
+                .verticalScroll(rememberScrollState())
         ) {
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(12.dp),
-                verticalAlignment = Alignment.CenterVertically
+            ScreenHeader(
+                title = "App Permissions",
+                supportingText = "Nearby communication access",
+                onBack = onBack
+            )
+            Column(
+                modifier = Modifier.padding(20.dp),
+                verticalArrangement = Arrangement.spacedBy(18.dp)
             ) {
-                IconButton(onClick = onBack) {
-                    Icon(imageVector = Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
-                }
-                Text(
-                    text = "App Permissions",
-                    style = MaterialTheme.typography.headlineSmall
+                StatusPill(
+                    text = if (requested) {
+                        "Request completed"
+                    } else {
+                        "Required for offline discovery"
+                    }
                 )
+                PermissionItem(
+                    icon = Icons.Default.Bluetooth,
+                    title = "Bluetooth nearby devices",
+                    description =
+                        "Used for peer discovery and short-range device connection."
+                )
+                PermissionItem(
+                    icon = Icons.Default.Wifi,
+                    title = "Wi-Fi Direct",
+                    description =
+                        "Used for higher-speed local transfer without Internet."
+                )
+                PermissionItem(
+                    icon = Icons.Default.LocationOn,
+                    title = "Location",
+                    description =
+                        "Required by Android for nearby wireless scanning on supported versions."
+                )
+                PermissionItem(
+                    icon = Icons.Default.Notifications,
+                    title = "Notifications",
+                    description =
+                        "Used later for transfer, sync, and wallet transaction status."
+                )
+                ActionButton(
+                    label = "Request permissions",
+                    icon = Icons.Default.CheckCircle,
+                    onClick = { launcher.launch(permissions.toTypedArray()) },
+                    modifier = Modifier.fillMaxWidth()
+                )
+                InfoRow(label = "Last request", value = resultSummary)
             }
-
-            StatusPill(text = if (requested) "Request completed" else "Required for offline discovery")
-            PermissionItem(
-                icon = Icons.Default.Bluetooth,
-                title = "Bluetooth nearby devices",
-                description = "Used for peer discovery and short-range device connection."
-            )
-            PermissionItem(
-                icon = Icons.Default.Wifi,
-                title = "Wi-Fi Direct",
-                description = "Used for higher-speed local transfer without Internet."
-            )
-            PermissionItem(
-                icon = Icons.Default.LocationOn,
-                title = "Location",
-                description = "Required by Android for nearby wireless scanning on supported versions."
-            )
-            PermissionItem(
-                icon = Icons.Default.Notifications,
-                title = "Notifications",
-                description = "Used later for transfer, sync, and wallet transaction status."
-            )
-            ActionButton(
-                label = "Request permissions",
-                icon = Icons.Default.CheckCircle,
-                onClick = { launcher.launch(permissions.toTypedArray()) },
-                modifier = Modifier.fillMaxWidth()
-            )
-            InfoRow(label = "Last request", value = resultSummary)
         }
     }
 }
