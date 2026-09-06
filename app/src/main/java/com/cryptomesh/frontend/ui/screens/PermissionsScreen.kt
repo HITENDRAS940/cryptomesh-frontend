@@ -1,7 +1,5 @@
 package com.cryptomesh.frontend.ui.screens
 
-import android.Manifest
-import android.os.Build
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.Arrangement
@@ -15,9 +13,7 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Bluetooth
 import androidx.compose.material.icons.filled.CheckCircle
-import androidx.compose.material.icons.filled.LocationOn
 import androidx.compose.material.icons.filled.Notifications
-import androidx.compose.material.icons.filled.Wifi
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
@@ -35,10 +31,13 @@ import com.cryptomesh.frontend.ui.components.ActionButton
 import com.cryptomesh.frontend.ui.components.InfoRow
 import com.cryptomesh.frontend.ui.components.ScreenHeader
 import com.cryptomesh.frontend.ui.components.StatusPill
+import com.cryptomesh.frontend.notification.requiredNotificationPermissions
+import com.cryptomesh.frontend.transport.requiredBluetoothPermissions
 
 @Composable
 fun PermissionsScreen(
-    onBack: () -> Unit
+    onBack: () -> Unit,
+    onPermissionsGranted: () -> Unit
 ) {
     var requested by remember { mutableStateOf(false) }
     var resultSummary by remember { mutableStateOf("Permissions not requested in this session.") }
@@ -49,6 +48,9 @@ fun PermissionsScreen(
         requested = true
         val granted = results.count { it.value }
         resultSummary = "$granted of ${results.size} requested permissions granted."
+        if (results.isNotEmpty() && results.values.all { it }) {
+            onPermissionsGranted()
+        }
     }
 
     Surface(
@@ -78,27 +80,15 @@ fun PermissionsScreen(
                 )
                 PermissionItem(
                     icon = Icons.Default.Bluetooth,
-                    title = "Bluetooth nearby devices",
+                    title = "Nearby devices",
                     description =
-                        "Used for peer discovery and short-range device connection."
-                )
-                PermissionItem(
-                    icon = Icons.Default.Wifi,
-                    title = "Wi-Fi Direct",
-                    description =
-                        "Used for higher-speed local transfer without Internet."
-                )
-                PermissionItem(
-                    icon = Icons.Default.LocationOn,
-                    title = "Location",
-                    description =
-                        "Required by Android for nearby wireless scanning on supported versions."
+                        "Allows BLE discovery, advertising, and direct encrypted communication."
                 )
                 PermissionItem(
                     icon = Icons.Default.Notifications,
                     title = "Notifications",
                     description =
-                        "Used later for transfer, sync, and wallet transaction status."
+                        "Alerts you about nearby peers, secure connections, messages, and delivery updates."
                 )
                 ActionButton(
                     label = "Request permissions",
@@ -146,22 +136,6 @@ private fun PermissionItem(
 }
 
 private fun requiredPermissions(): List<String> {
-    val permissions = mutableListOf(
-        Manifest.permission.ACCESS_FINE_LOCATION
-    )
-
-    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-        permissions += Manifest.permission.BLUETOOTH_SCAN
-        permissions += Manifest.permission.BLUETOOTH_CONNECT
-    } else {
-        permissions += Manifest.permission.BLUETOOTH
-        permissions += Manifest.permission.BLUETOOTH_ADMIN
-    }
-
-    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-        permissions += Manifest.permission.NEARBY_WIFI_DEVICES
-        permissions += Manifest.permission.POST_NOTIFICATIONS
-    }
-
-    return permissions
+    return requiredBluetoothPermissions() +
+        requiredNotificationPermissions()
 }

@@ -79,9 +79,9 @@ fun CreateIdentityScreen(
                 )
                 EmptyState(
                     icon = Icons.Default.Badge,
-                    title = "Local-only placeholder",
+                    title = "Stored securely",
                     description =
-                        "Your identity stays on this device and remains available offline."
+                        "Your identity and public key remain available offline."
                 )
             }
         }

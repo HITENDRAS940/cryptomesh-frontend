@@ -1,138 +1,202 @@
 package com.cryptomesh.frontend.ui.state
 
+import com.cryptomesh.frontend.data.repository.DirectMeshState
+import com.cryptomesh.frontend.data.repository.DirectMessage
+import com.cryptomesh.frontend.data.repository.DirectMessageStatus
+import com.cryptomesh.frontend.data.repository.DirectPeer
+import com.cryptomesh.frontend.data.repository.DirectPeerStatus
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.test.UnconfinedTestDispatcher
+import kotlinx.coroutines.test.advanceUntilIdle
+import kotlinx.coroutines.test.resetMain
+import kotlinx.coroutines.test.runTest
+import kotlinx.coroutines.test.setMain
+import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
+import org.junit.Before
 import org.junit.Test
 
+@OptIn(ExperimentalCoroutinesApi::class)
 class ChatViewModelTest {
+    private val dispatcher = UnconfinedTestDispatcher()
+
+    @Before
+    fun setUp() {
+        Dispatchers.setMain(dispatcher)
+    }
+
+    @After
+    fun tearDown() {
+        Dispatchers.resetMain()
+    }
+
     @Test
-    fun openingConversationMarksItReadAndClosingReturnsToInbox() {
-        val viewModel = ChatViewModel()
-        val conversation = viewModel.uiState.value.conversations.first()
-        assertTrue(conversation.unreadCount > 0)
+    fun betaStartsWithoutSeededConversations() {
+        val viewModel = ChatViewModel(FakeDirectMeshRepository())
 
-        viewModel.openConversation(conversation.id)
-
-        val opened = viewModel.uiState.value
-        assertEquals(conversation.id, opened.selectedConversationId)
-        assertEquals(0, opened.conversations.first().unreadCount)
-
-        viewModel.closeConversation()
+        assertTrue(viewModel.uiState.value.conversations.isEmpty())
         assertNull(viewModel.uiState.value.selectedConversationId)
     }
 
     @Test
-    fun directMessageProgressesToEndToEndAcknowledgement() {
-        val viewModel = ChatViewModel()
-        val conversation = viewModel.uiState.value.conversations.first {
-            it.route == ConversationRoute.Direct
-        }
+    fun authenticatedPeerCreatesLiveConversationAndSendsText() = runTest {
+        val repository = FakeDirectMeshRepository(
+            DirectMeshState(peers = listOf(connectedPeer()))
+        )
+        val viewModel = ChatViewModel(repository)
+        advanceUntilIdle()
+        val conversation = viewModel.uiState.value.conversations.single()
+
         viewModel.openConversation(conversation.id)
-        viewModel.updateComposer("Meet at the north gate")
-
+        viewModel.updateComposer("  real BLE message  ")
         viewModel.sendMessage()
+        advanceUntilIdle()
 
-        val queued = selectedConversation(viewModel).messages.last()
-        assertEquals(MessageDeliveryStatus.QueuedLocally, queued.deliveryStatus)
-        assertTrue(queued.autoAdvance)
-        assertTrue(queued.animateOnAppearance)
-
-        viewModel.markMessageAnimationComplete(queued.id)
-        assertFalse(
-            selectedConversation(viewModel).messages.last().animateOnAppearance
-        )
-
-        viewModel.advanceDelivery(queued.id)
         assertEquals(
-            MessageDeliveryStatus.DirectlyDelivered,
-            selectedConversation(viewModel).messages.last().deliveryStatus
+            listOf("CM-12345678" to "real BLE message"),
+            repository.sentMessages
         )
-
-        viewModel.advanceDelivery(queued.id)
-        val acknowledged = selectedConversation(viewModel).messages.last()
-        assertEquals(MessageDeliveryStatus.Acknowledged, acknowledged.deliveryStatus)
-        assertEquals("End-to-end ACK received", acknowledged.delivery?.ackStatus)
-        assertFalse(acknowledged.autoAdvance)
+        assertEquals("", viewModel.uiState.value.composerText)
     }
 
     @Test
-    fun relayMessageProgressesThroughStoreCarryForward() {
-        val viewModel = ChatViewModel()
-        val conversation = viewModel.uiState.value.conversations.first {
-            it.route == ConversationRoute.Relay
-        }
-        viewModel.openConversation(conversation.id)
-        viewModel.updateComposer("Offline update")
-        viewModel.sendMessage()
-        val messageId = selectedConversation(viewModel).messages.last().id
-
-        viewModel.advanceDelivery(messageId)
-        assertEquals(
-            MessageDeliveryStatus.StoredOnRelay,
-            selectedConversation(viewModel).messages.last().deliveryStatus
+    fun duplicateLinksForAuthenticatedDeviceCreateOneConversation() = runTest {
+        val repository = FakeDirectMeshRepository(
+            DirectMeshState(
+                peers = listOf(
+                    connectedPeer().copy(
+                        linkId = "stale-link",
+                        displayName = "Stale peer",
+                        status = DirectPeerStatus.Discovered,
+                        isVerified = false
+                    ),
+                    connectedPeer()
+                )
+            )
         )
+        val viewModel = ChatViewModel(repository)
+        advanceUntilIdle()
 
-        viewModel.advanceDelivery(messageId)
-        assertEquals(
-            MessageDeliveryStatus.CarriedByRelay,
-            selectedConversation(viewModel).messages.last().deliveryStatus
-        )
+        val conversation = viewModel.uiState.value.conversations.single()
 
-        viewModel.advanceDelivery(messageId)
-        assertEquals(
-            MessageDeliveryStatus.Forwarding,
-            selectedConversation(viewModel).messages.last().deliveryStatus
-        )
-
-        viewModel.advanceDelivery(messageId)
-        val acknowledged = selectedConversation(viewModel).messages.last()
-        assertEquals(MessageDeliveryStatus.Acknowledged, acknowledged.deliveryStatus)
-        assertEquals(1, acknowledged.delivery?.relayCount)
+        assertEquals("live-CM-12345678", conversation.id)
+        assertEquals("Beta Peer", conversation.peerName)
+        assertTrue(conversation.isConnected)
     }
 
     @Test
-    fun failedMessageCanRetryThroughRelay() {
-        val viewModel = ChatViewModel()
-        val conversation = viewModel.uiState.value.conversations.first {
-            it.route == ConversationRoute.Offline
-        }
-        viewModel.openConversation(conversation.id)
-        viewModel.updateComposer("Are you available?")
-        viewModel.sendMessage()
-        val messageId = selectedConversation(viewModel).messages.last().id
+    fun repositoryMessagesMapToAcknowledgementAndFailureStates() = runTest {
+        val peer = connectedPeer()
+        val repository = FakeDirectMeshRepository(
+            DirectMeshState(
+                peers = listOf(peer),
+                messages = listOf(
+                    directMessage(
+                        "packet-ack",
+                        DirectMessageStatus.Acknowledged
+                    ),
+                    directMessage(
+                        "packet-failed",
+                        DirectMessageStatus.Failed
+                    )
+                )
+            )
+        )
+        val viewModel = ChatViewModel(repository)
+        advanceUntilIdle()
 
-        viewModel.advanceDelivery(messageId)
+        val messages = viewModel.uiState.value
+            .conversations.single().messages
+
+        assertEquals(
+            MessageDeliveryStatus.Acknowledged,
+            messages.first().deliveryStatus
+        )
         assertEquals(
             MessageDeliveryStatus.Failed,
-            selectedConversation(viewModel).messages.last().deliveryStatus
+            messages.last().deliveryStatus
         )
-
-        viewModel.retryMessage(messageId)
-        viewModel.advanceDelivery(messageId)
-
-        val relayed = selectedConversation(viewModel).messages.last()
-        assertEquals(MessageDeliveryStatus.StoredOnRelay, relayed.deliveryStatus)
-        assertEquals(2, relayed.deliveryAttempts)
-        assertEquals(1, relayed.delivery?.replicaCount)
     }
 
     @Test
-    fun emptyComposerDoesNotCreateMessage() {
-        val viewModel = ChatViewModel()
-        val conversation = viewModel.uiState.value.conversations.first()
+    fun verifiedOfflineConversationQueuesText() = runTest {
+        val repository = FakeDirectMeshRepository(
+            DirectMeshState(
+                peers = listOf(
+                    connectedPeer().copy(
+                        status = DirectPeerStatus.Discovered,
+                        isVerified = true
+                    )
+                )
+            )
+        )
+        val viewModel = ChatViewModel(repository)
+        advanceUntilIdle()
+        val conversation = viewModel.uiState.value.conversations.single()
+
         viewModel.openConversation(conversation.id)
-        val originalCount = selectedConversation(viewModel).messages.size
-
-        viewModel.updateComposer("   ")
+        viewModel.updateComposer("send later")
         viewModel.sendMessage()
+        advanceUntilIdle()
 
-        assertEquals(originalCount, selectedConversation(viewModel).messages.size)
+        assertEquals(
+            listOf("CM-12345678" to "send later"),
+            repository.sentMessages
+        )
+        assertEquals("", viewModel.uiState.value.composerText)
     }
 
-    private fun selectedConversation(viewModel: ChatViewModel): ConversationUiModel {
-        val state = viewModel.uiState.value
-        return state.conversations.first { it.id == state.selectedConversationId }
+    @Test
+    fun unauthenticatedConversationDoesNotSend() = runTest {
+        val repository = FakeDirectMeshRepository(
+            DirectMeshState(
+                peers = listOf(
+                    connectedPeer().copy(
+                        status = DirectPeerStatus.Discovered,
+                        isVerified = false
+                    )
+                )
+            )
+        )
+        val viewModel = ChatViewModel(repository)
+        advanceUntilIdle()
+        val conversation = viewModel.uiState.value.conversations.single()
+
+        viewModel.openConversation(conversation.id)
+        viewModel.updateComposer("cannot send")
+        viewModel.sendMessage()
+
+        assertTrue(repository.sentMessages.isEmpty())
+        assertFalse(viewModel.uiState.value.errorMessage.isNullOrBlank())
+    }
+
+    private fun connectedPeer(): DirectPeer {
+        return DirectPeer(
+            linkId = "link-1",
+            advertisedDeviceId = "CM-12345678",
+            deviceId = "CM-12345678",
+            displayName = "Beta Peer",
+            signalStrength = -50,
+            status = DirectPeerStatus.Connected,
+            isVerified = true
+        )
+    }
+
+    private fun directMessage(
+        id: String,
+        status: DirectMessageStatus
+    ): DirectMessage {
+        return DirectMessage(
+            packetId = id,
+            peerDeviceId = "CM-12345678",
+            text = id,
+            sentAtEpochMillis = if (id == "packet-ack") 1L else 2L,
+            isOutgoing = true,
+            status = status
+        )
     }
 }

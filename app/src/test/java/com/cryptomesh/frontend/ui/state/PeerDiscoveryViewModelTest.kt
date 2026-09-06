@@ -1,79 +1,126 @@
 package com.cryptomesh.frontend.ui.state
 
+import com.cryptomesh.frontend.data.repository.DirectMeshState
+import com.cryptomesh.frontend.data.repository.DirectPeer
+import com.cryptomesh.frontend.data.repository.DirectPeerStatus
+import com.cryptomesh.frontend.transport.TransportUnavailableReason
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.test.UnconfinedTestDispatcher
+import kotlinx.coroutines.test.advanceUntilIdle
+import kotlinx.coroutines.test.resetMain
+import kotlinx.coroutines.test.runTest
+import kotlinx.coroutines.test.setMain
+import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
+import org.junit.Before
 import org.junit.Test
 
+@OptIn(ExperimentalCoroutinesApi::class)
 class PeerDiscoveryViewModelTest {
+    private val dispatcher = UnconfinedTestDispatcher()
+
+    @Before
+    fun setUp() {
+        Dispatchers.setMain(dispatcher)
+    }
+
+    @After
+    fun tearDown() {
+        Dispatchers.resetMain()
+    }
+
     @Test
-    fun completingScanReturnsPrivacySafePeerSummaries() {
-        val viewModel = PeerDiscoveryViewModel()
+    fun betaStartsTransportWithoutSeededPeers() {
+        val repository = FakeDirectMeshRepository()
+        val viewModel = PeerDiscoveryViewModel(repository)
+
+        assertEquals(1, repository.startCalls)
+        assertTrue(viewModel.uiState.value.peers.isEmpty())
+    }
+
+    @Test
+    fun liveRepositoryPeerMapsToVerifiedUiState() = runTest {
+        val repository = FakeDirectMeshRepository()
+        val viewModel = PeerDiscoveryViewModel(repository)
+
+        repository.emit(
+            DirectMeshState(
+                peers = listOf(
+                    DirectPeer(
+                        linkId = "ble-link",
+                        advertisedDeviceId = "CM-ABCDEF12",
+                        deviceId = "CM-ABCDEF12",
+                        displayName = "Physical Phone",
+                        signalStrength = -52,
+                        status = DirectPeerStatus.Connected,
+                        isVerified = true
+                    )
+                )
+            )
+        )
+        advanceUntilIdle()
+
+        val peer = viewModel.uiState.value.peers.single()
+        assertEquals("Physical Phone", peer.displayName)
+        assertEquals(PeerConnectionStatus.Connected, peer.connectionStatus)
+        assertTrue(peer.isVerified)
+    }
+
+    @Test
+    fun bluetoothDisabledReasonIsExposedToTheScreen() = runTest {
+        val repository = FakeDirectMeshRepository()
+        val viewModel = PeerDiscoveryViewModel(repository)
+
+        repository.emit(
+            DirectMeshState(
+                transportUnavailableReason =
+                    TransportUnavailableReason.BluetoothDisabled,
+                scanError = "Turn on Bluetooth."
+            )
+        )
+        advanceUntilIdle()
+
+        assertEquals(
+            TransportUnavailableReason.BluetoothDisabled,
+            viewModel.uiState.value.transportUnavailableReason
+        )
+        assertEquals(
+            "Turn on Bluetooth.",
+            viewModel.uiState.value.scanError
+        )
+    }
+
+    @Test
+    fun scanConnectAndDisconnectCommandsReachRepository() {
+        val repository = FakeDirectMeshRepository(
+            DirectMeshState(
+                peers = listOf(
+                    DirectPeer(
+                        linkId = "ble-link",
+                        advertisedDeviceId = "CM-ABCDEF12",
+                        deviceId = null,
+                        displayName = "CryptoMesh peer",
+                        signalStrength = -70,
+                        status = DirectPeerStatus.Discovered
+                    )
+                )
+            )
+        )
+        val viewModel = PeerDiscoveryViewModel(repository)
 
         viewModel.startScan()
-        assertTrue(viewModel.uiState.value.isScanning)
-
-        viewModel.completeScan()
-
-        val state = viewModel.uiState.value
-        assertFalse(state.isScanning)
-        assertTrue(state.hasScanned)
-        assertEquals(3, state.peers.size)
-        assertEquals("Balanced", state.peers.first().resources.batteryClass)
-        assertEquals(RelayEligibility.DirectDestination, state.peers.first().relayEligibility)
-    }
-
-    @Test
-    fun verifiedPeerCanConnect() {
-        val viewModel = scannedViewModel()
-        val peerId = viewModel.uiState.value.peers.first().id
-
-        viewModel.requestConnection(peerId)
+        viewModel.requestConnection("ble-link")
         viewModel.confirmConnection()
-        assertEquals(
-            PeerConnectionStatus.Connecting,
-            viewModel.uiState.value.peers.first().connectionStatus
-        )
-
-        viewModel.completeConnection(peerId)
-
-        assertEquals(
-            PeerConnectionStatus.Connected,
-            viewModel.uiState.value.peers.first().connectionStatus
-        )
-    }
-
-    @Test
-    fun unavailablePeerShowsRetryableFailure() {
-        val viewModel = scannedViewModel()
-        val peer = viewModel.uiState.value.peers.last()
-
-        viewModel.requestConnection(peer.id)
-        viewModel.confirmConnection()
-        viewModel.completeConnection(peer.id)
-
-        val updatedPeer = viewModel.uiState.value.peers.last()
-        assertEquals(PeerConnectionStatus.Failed, updatedPeer.connectionStatus)
-        assertTrue(updatedPeer.failureMessage?.contains("out of range") == true)
-    }
-
-    @Test
-    fun stoppingScanProducesEmptyCompletedState() {
-        val viewModel = PeerDiscoveryViewModel()
-
-        viewModel.startScan()
+        viewModel.disconnect("ble-link")
         viewModel.stopScan()
 
-        val state = viewModel.uiState.value
-        assertFalse(state.isScanning)
-        assertTrue(state.hasScanned)
-        assertTrue(state.peers.isEmpty())
-    }
-
-    private fun scannedViewModel(): PeerDiscoveryViewModel {
-        return PeerDiscoveryViewModel().also {
-            it.startScan()
-            it.completeScan()
-        }
+        assertEquals(1, repository.scanCalls)
+        assertEquals(listOf("ble-link"), repository.connectionRequests)
+        assertEquals(listOf("ble-link"), repository.disconnectionRequests)
+        assertEquals(1, repository.stopScanCalls)
+        assertFalse(viewModel.uiState.value.peers.isEmpty())
     }
 }

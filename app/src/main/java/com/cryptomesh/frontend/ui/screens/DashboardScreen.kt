@@ -9,6 +9,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Badge
+import androidx.compose.material.icons.filled.Bluetooth
 import androidx.compose.material.icons.filled.Home
 import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material3.Icon
@@ -23,14 +24,31 @@ import com.cryptomesh.frontend.ui.components.MainTabHeader
 import com.cryptomesh.frontend.ui.components.MetricCard
 import com.cryptomesh.frontend.ui.components.SectionHeader
 import com.cryptomesh.frontend.ui.components.StatusPill
+import com.cryptomesh.frontend.data.repository.DirectMeshState
+import com.cryptomesh.frontend.data.repository.DirectMessageStatus
+import com.cryptomesh.frontend.data.repository.DirectPeerStatus
+import com.cryptomesh.frontend.transport.TransportUnavailableReason
 import com.cryptomesh.frontend.ui.state.LocalIdentity
 
 @Composable
 fun DashboardScreen(
     identity: LocalIdentity?,
+    meshState: DirectMeshState,
     onOpenProfile: () -> Unit,
-    onOpenPermissions: () -> Unit
+    onOpenPermissions: () -> Unit,
+    onEnableBluetooth: () -> Unit
 ) {
+    val connectedPeers = meshState.peers.count {
+        it.status == DirectPeerStatus.Connected
+    }
+    val pendingMessages = meshState.messages.count {
+        it.isOutgoing &&
+            it.status != DirectMessageStatus.Acknowledged &&
+            it.status != DirectMessageStatus.Failed
+    }
+    val acknowledgedMessages = meshState.messages.count {
+        it.status == DirectMessageStatus.Acknowledged
+    }
     Surface(
         modifier = Modifier.fillMaxSize(),
         color = MaterialTheme.colorScheme.background
@@ -86,25 +104,41 @@ fun DashboardScreen(
                 item {
                     MetricCard(
                         title = "Nearby peers",
-                        value = "0",
-                        supportingText = "Use Peers to scan for local devices."
+                        value = meshState.peers.size.toString(),
+                        supportingText = "$connectedPeers authenticated sessions"
                     )
                 }
                 item {
                     MetricCard(
-                        title = "Pending packets",
-                        value = "0",
-                        supportingText =
-                            "Messages, files, and wallet packets will appear here."
+                        title = "Messages awaiting ACK",
+                        value = pendingMessages.toString(),
+                        supportingText = "$acknowledgedMessages messages acknowledged"
                     )
                 }
                 item {
-                    MetricCard(
-                        title = "Wallet balance",
-                        value = "1,250.00 ₹",
-                        supportingText =
-                            "45.00 ₹ is pending backend settlement."
+                    StatusPill(
+                        text = when {
+                            !meshState.transportAvailable ->
+                                "Bluetooth unavailable"
+                            meshState.isScanning -> "Scanning for peers"
+                            meshState.isAdvertising -> "Visible to nearby peers"
+                            meshState.transportAvailable -> "Bluetooth ready"
+                            else -> "Bluetooth not active"
+                        }
                     )
+                }
+                if (
+                    meshState.transportUnavailableReason ==
+                    TransportUnavailableReason.BluetoothDisabled
+                ) {
+                    item {
+                        ActionButton(
+                            label = "Turn on Bluetooth",
+                            icon = Icons.Default.Bluetooth,
+                            onClick = onEnableBluetooth,
+                            modifier = Modifier.fillMaxWidth()
+                        )
+                    }
                 }
             }
         }

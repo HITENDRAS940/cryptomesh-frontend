@@ -1,78 +1,90 @@
-# CryptoMesh Frontend
+# CryptoMesh Android Beta
 
-Android frontend for the CryptoMesh project.
+CryptoMesh is an offline Android application for discovering nearby CryptoMesh
+devices and exchanging authenticated, encrypted text messages over Bluetooth
+Low Energy, including opportunistic store-carry-forward relay through trusted
+mesh peers.
 
-This folder contains the frontend implementation in progress.
+Version: `0.2.0-beta01`
 
-Implemented so far:
+## Beta Scope
 
-- Kotlin Android project structure.
-- Jetpack Compose setup.
-- Material 3 theme.
-- Bottom navigation app shell.
-- Reusable UI components.
-- Placeholder screen for Sync.
-- Identity onboarding flow.
-- Local profile screen.
-- Runtime permission request screen for nearby device features.
-- Simulated nearby peer scanning with idle, scanning, empty, and error states.
-- Peer details with trust, encounter history, and privacy-safe resource summaries.
-- Connection confirmation, connected, failed, retry, and disconnect states.
-- Relay eligibility indicators for direct, eligible, and unavailable peers.
-- Secure conversation inbox with verified-session and route indicators.
-- Chat threads with outgoing and incoming message bubbles.
-- Local message composer with direct and relay delivery simulations.
-- Readable delivery, ACK, expiry, failure, and retry states.
-- Packet delivery details with replica, hop, relay, expiry, and path summaries.
-- Android document picker integration with attachment previews and optional captions.
-- File transfer cards with chunk progress, verification, retry, and completion states.
-- Direct, relay, unavailable-route, and stricter large-file policy simulations.
-- Incoming file request decisions and file transfer policy details.
-- Prepaid offline wallet dashboard with available and pending balances.
-- Signed payment flow with direct, trusted-relay, and unavailable routes.
-- Incoming payment confirmation with signature verification.
-- Transaction history with synchronized, pending, rejected, duplicate, expired,
-  and signature-failure states.
-- Separate receiver-delivery, relay-delivery, and backend-settlement details.
-- Sync dashboard with backend readiness and last synchronization timestamps.
-- Filterable local queues for messages, files, wallet items, own packets, relay
-  packets, ACKs, expiry, and failures.
-- Manual backend synchronization simulation with peer-delivery items kept local.
-- Replica cleanup through the Sync ViewModel with expired-item reporting.
-- Detailed duplicate, delivery, and backend rejection explanations.
+Implemented:
 
-Phase 3 currently uses local sample peers. The ViewModel boundary is ready for a
-Bluetooth or nearby Wi-Fi repository when the transport layer is implemented.
+- Persistent local identity backed by Room.
+- Non-exportable P-256 signing key in Android Keystore.
+- BLE advertising, scanning, GATT connections, and chunked transport.
+- Signed ephemeral ECDH peer handshake.
+- HKDF-SHA256 per-session key derivation.
+- AES-256-GCM encrypted text and media chunks.
+- Signed secure-packet envelopes with expiry and duplicate protection.
+- Encrypted end-to-end acknowledgements.
+- Decentralized queued packet relay across authenticated BLE mesh links.
+- Offline photo, video, and audio transfer using chunked BLE packets.
+- Foreground local notifications for peer, connection, and message activity.
+- Live Home, Peers, Chat, Profile, and Permissions screens.
 
-Phase 4 currently uses local sample conversations and simulated delivery events.
-The Chat ViewModel is ready to consume repository-provided encrypted messages,
-transport states, and acknowledgements.
+Not included in this beta:
 
-Phase 5 uses Android's local document picker and simulates encrypted chunk
-forwarding, relay storage, verification, failure, and retry states. File bytes are
-not uploaded or transmitted by this frontend-only implementation.
+- Internet or backend synchronization.
+- Adaptive replication policy beyond opportunistic relay.
+- Wallet or payment functionality.
+- Wi-Fi Direct transport.
+- Background reconnection or a foreground Bluetooth service.
+- Durable plaintext conversation history.
 
-Phase 6 uses local sample balances and transactions. It simulates signing,
-receiver delivery, trusted-relay delivery, pending credit, expiry, and retry.
-Backend settlement remains a separate displayed state and is not performed by
-this frontend-only implementation.
+No seeded peers, conversations, transactions, diagnostics, simulations, or
+Compose preview data are included in the beta application.
 
-Phase 7 uses a StateFlow-backed local queue simulation. Manual synchronization,
-ACK state, relay storage, expiry cleanup, duplicate handling, and backend errors
-are represented in the frontend. Room, WorkManager, network connectivity, and
-the live backend are not connected yet.
+## Documentation
 
-## Open In Android Studio
+- [Beta User Guide](USER_GUIDE.md)
+- [Technical Documentation](TECHNICAL_DOCUMENTATION.md)
+- [Logical Module Documentation](MODULE_DOCUMENTATION.md)
+- [Frontend Phase Plan](../FRONTEND_PHASE_PLAN.md)
 
-Open this folder:
+## Requirements
+
+- Android 8.0 (API 26) or newer.
+- Bluetooth Low Energy.
+- BLE advertising support for incoming discovery.
+- Two physical Android devices for end-to-end testing.
+- Nearby Devices permission on Android 12 or newer.
+- Location permission for BLE scanning on Android 8 through Android 11.
+- Notification permission on Android 13 or newer.
+
+Internet access and a backend are not required.
+
+## Build
+
+Open this directory in Android Studio:
 
 ```text
 /Users/hitendrasingh/Desktop/project/cryptomesh-frontend
 ```
 
-Android Studio should sync the Gradle project and download dependencies if required.
+Or build from the terminal:
 
-## Next Phase
+```bash
+./gradlew :app:assembleDebug
+```
 
-Phase 8 will add developer diagnostics, packet inspection, demo controls,
-sample-data management, responsive layout checks, and presentation polish.
+Generated APK:
+
+```text
+app/build/outputs/apk/debug/app-debug.apk
+```
+
+## Verification
+
+Run the complete local gate:
+
+```bash
+./gradlew :app:testDebugUnitTest :app:lintDebug :app:assembleDebug
+```
+
+The repository includes unit coverage for identity persistence, packet storage,
+BLE framing, signed handshake verification, wire encoding, packet
+encryption/tamper rejection, media chunk encryption/reassembly, ViewModel
+state, paired two-peer encrypted message/ACK exchange, and three-node offline
+relay paths for text and media.

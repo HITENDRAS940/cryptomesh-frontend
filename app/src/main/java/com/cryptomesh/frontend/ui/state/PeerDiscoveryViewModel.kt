@@ -1,49 +1,69 @@
 package com.cryptomesh.frontend.ui.state
 
 import androidx.lifecycle.ViewModel
+import androidx.lifecycle.ViewModelProvider
+import androidx.lifecycle.viewModelScope
+import com.cryptomesh.frontend.data.repository.DirectMeshRepository
+import com.cryptomesh.frontend.data.repository.DirectPeer
+import com.cryptomesh.frontend.data.repository.DirectPeerStatus
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.launch
 
-class PeerDiscoveryViewModel : ViewModel() {
+class PeerDiscoveryViewModel(
+    private val directMeshRepository: DirectMeshRepository
+) : ViewModel() {
     private val _uiState = MutableStateFlow(PeerDiscoveryUiState())
     val uiState: StateFlow<PeerDiscoveryUiState> = _uiState.asStateFlow()
+    private var scanStarted = false
+
+    init {
+        directMeshRepository.start()
+        viewModelScope.launch {
+            directMeshRepository.state.collect { meshState ->
+                _uiState.update { current ->
+                    current.copy(
+                        isScanning = meshState.isScanning,
+                        hasScanned = scanStarted && !meshState.isScanning,
+                        peers = meshState.peers.map(DirectPeer::toUiModel),
+                        scanError = meshState.scanError,
+                        transportUnavailableReason =
+                            meshState.transportUnavailableReason,
+                        selectedPeerId = current.selectedPeerId?.takeIf {
+                            selected ->
+                            meshState.peers.any { it.linkId == selected }
+                        },
+                        connectionRequestPeerId =
+                            current.connectionRequestPeerId?.takeIf {
+                                requested ->
+                                meshState.peers.any {
+                                    it.linkId == requested
+                                }
+                            }
+                    )
+                }
+            }
+        }
+    }
 
     fun startScan() {
+        scanStarted = true
         _uiState.update {
             it.copy(
                 isScanning = true,
                 hasScanned = false,
-                peers = emptyList(),
                 scanError = null,
                 selectedPeerId = null,
                 connectionRequestPeerId = null
             )
         }
+        directMeshRepository.startScan()
     }
 
     fun stopScan() {
-        _uiState.update {
-            it.copy(
-                isScanning = false,
-                hasScanned = true
-            )
-        }
-    }
-
-    fun completeScan() {
-        _uiState.update {
-            if (!it.isScanning) {
-                it
-            } else {
-                it.copy(
-                    isScanning = false,
-                    hasScanned = true,
-                    peers = samplePeers
-                )
-            }
-        }
+        directMeshRepository.stopScan()
     }
 
     fun reportScanFailure(message: String) {
@@ -51,14 +71,15 @@ class PeerDiscoveryViewModel : ViewModel() {
             it.copy(
                 isScanning = false,
                 hasScanned = true,
-                peers = emptyList(),
                 scanError = message
             )
         }
     }
 
     fun selectPeer(peerId: String) {
-        _uiState.update { it.copy(selectedPeerId = peerId) }
+        if (_uiState.value.peers.any { it.id == peerId }) {
+            _uiState.update { it.copy(selectedPeerId = peerId) }
+        }
     }
 
     fun dismissPeerDetails() {
@@ -66,7 +87,9 @@ class PeerDiscoveryViewModel : ViewModel() {
     }
 
     fun requestConnection(peerId: String) {
-        val peer = _uiState.value.peers.firstOrNull { it.id == peerId } ?: return
+        val peer = _uiState.value.peers.firstOrNull {
+            it.id == peerId
+        } ?: return
         if (peer.connectionStatus == PeerConnectionStatus.Connected) return
         _uiState.update { it.copy(connectionRequestPeerId = peerId) }
     }
@@ -77,120 +100,58 @@ class PeerDiscoveryViewModel : ViewModel() {
 
     fun confirmConnection() {
         val peerId = _uiState.value.connectionRequestPeerId ?: return
-        updatePeer(peerId) {
-            it.copy(
-                connectionStatus = PeerConnectionStatus.Connecting,
-                failureMessage = null
-            )
-        }
         _uiState.update { it.copy(connectionRequestPeerId = null) }
+        directMeshRepository.connect(peerId)
     }
 
     fun retryConnection(peerId: String) {
-        updatePeer(peerId) {
-            it.copy(
-                connectionStatus = PeerConnectionStatus.Connecting,
-                failureMessage = null
-            )
-        }
-    }
-
-    fun completeConnection(peerId: String) {
-        updatePeer(peerId) { peer ->
-            if (peer.id == UNAVAILABLE_PEER_ID) {
-                peer.copy(
-                    connectionStatus = PeerConnectionStatus.Failed,
-                    failureMessage = "Peer moved out of range. Scan again or retry nearby."
-                )
-            } else {
-                peer.copy(
-                    connectionStatus = PeerConnectionStatus.Connected,
-                    failureMessage = null
-                )
-            }
-        }
+        directMeshRepository.connect(peerId)
     }
 
     fun disconnect(peerId: String) {
-        updatePeer(peerId) {
-            it.copy(
-                connectionStatus = PeerConnectionStatus.Available,
-                failureMessage = null
-            )
+        directMeshRepository.disconnect(peerId)
+    }
+
+    companion object {
+        fun factory(
+            repository: DirectMeshRepository
+        ): ViewModelProvider.Factory {
+            return object : ViewModelProvider.Factory {
+                @Suppress("UNCHECKED_CAST")
+                override fun <T : ViewModel> create(
+                    modelClass: Class<T>
+                ): T = PeerDiscoveryViewModel(repository) as T
+            }
         }
     }
+}
 
-    private fun updatePeer(
-        peerId: String,
-        transform: (NearbyPeerUiModel) -> NearbyPeerUiModel
-    ) {
-        _uiState.update { state ->
-            state.copy(
-                peers = state.peers.map { peer ->
-                    if (peer.id == peerId) transform(peer) else peer
-                }
-            )
-        }
-    }
-
-    private companion object {
-        const val UNAVAILABLE_PEER_ID = "peer-03"
-
-        val samplePeers = listOf(
-            NearbyPeerUiModel(
-                id = "peer-01",
-                displayName = "Aarav's Pixel",
-                deviceId = "CM-7A21F4C8",
-                proximity = "Very close",
-                transport = "Nearby Wi-Fi",
-                trustLevel = PeerTrustLevel.Verified,
-                relayEligibility = RelayEligibility.DirectDestination,
-                resources = PeerResourceUiModel(
-                    batteryClass = "Balanced",
-                    storageClass = "Available",
-                    linkQuality = "Excellent",
-                    connectionStability = "Stable",
-                    reliability = "High"
-                ),
-                lastEncounter = "Today, 10:42 AM",
-                successfulConnections = 8
-            ),
-            NearbyPeerUiModel(
-                id = "peer-02",
-                displayName = "Library Relay",
-                deviceId = "CM-2D90B1E6",
-                proximity = "Nearby",
-                transport = "Bluetooth",
-                trustLevel = PeerTrustLevel.Known,
-                relayEligibility = RelayEligibility.Eligible,
-                resources = PeerResourceUiModel(
-                    batteryClass = "High",
-                    storageClass = "Available",
-                    linkQuality = "Stable",
-                    connectionStability = "Stable",
-                    reliability = "High"
-                ),
-                lastEncounter = "Yesterday, 4:18 PM",
-                successfulConnections = 14
-            ),
-            NearbyPeerUiModel(
-                id = UNAVAILABLE_PEER_ID,
-                displayName = "Campus Node",
-                deviceId = "CM-5F33C0A2",
-                proximity = "At edge of range",
-                transport = "Bluetooth",
-                trustLevel = PeerTrustLevel.Unverified,
-                relayEligibility = RelayEligibility.NotEligible,
-                resources = PeerResourceUiModel(
-                    batteryClass = "Low",
-                    storageClass = "Limited",
-                    linkQuality = "Weak",
-                    connectionStability = "Unstable",
-                    reliability = "Unknown"
-                ),
-                lastEncounter = "First encounter",
-                successfulConnections = 0
-            )
-        )
-    }
+private fun DirectPeer.toUiModel(): NearbyPeerUiModel {
+    return NearbyPeerUiModel(
+        id = linkId,
+        displayName = displayName,
+        deviceId = deviceId ?: advertisedDeviceId ?: "Pending verification",
+        signalLabel = when {
+            signalStrength >= -55 -> "Excellent"
+            signalStrength >= -70 -> "Good"
+            signalStrength >= -85 -> "Fair"
+            else -> "Weak"
+        },
+        proximity = when {
+            signalStrength >= -55 -> "Very close"
+            signalStrength >= -70 -> "Nearby"
+            signalStrength >= -85 -> "In range"
+            else -> "At edge of range"
+        },
+        isVerified = isVerified,
+        connectionStatus = when (status) {
+            DirectPeerStatus.Discovered -> PeerConnectionStatus.Available
+            DirectPeerStatus.Connecting -> PeerConnectionStatus.Connecting
+            DirectPeerStatus.Authenticating ->
+                PeerConnectionStatus.Authenticating
+            DirectPeerStatus.Connected -> PeerConnectionStatus.Connected
+            DirectPeerStatus.Failed -> PeerConnectionStatus.Failed
+        },
+        failureMessage = failureMessage
+    )
 }
