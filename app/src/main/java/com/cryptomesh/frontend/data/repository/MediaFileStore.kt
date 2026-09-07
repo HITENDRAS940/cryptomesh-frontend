@@ -17,6 +17,16 @@ interface MediaFileStore {
         bytes: ByteArray
     ): String
 
+    /** Write a received fragment for a chunk and assemble when complete.
+     * Returns the assembled chunk path when assembly completes, otherwise null. */
+    fun writeEncryptedFragment(
+        transferId: String,
+        chunkIndex: Int,
+        fragmentIndex: Int,
+        totalFragments: Int,
+        bytes: ByteArray
+    ): String?
+
     /** Delete all files associated with a transfer (encrypted chunks and completed media). */
     fun deleteTransferFiles(transferId: String)
 }
@@ -51,6 +61,41 @@ class LocalMediaFileStore(
         val file = File(directory, safeSegment(fileName))
         file.writeBytes(bytes)
         return file.absolutePath
+    }
+
+    override fun writeEncryptedFragment(
+        transferId: String,
+        chunkIndex: Int,
+        fragmentIndex: Int,
+        totalFragments: Int,
+        bytes: ByteArray
+    ): String? {
+        val transferDir = File(root, safeSegment(transferId)).apply { mkdirs() }
+        val fragDir = File(transferDir, "fragments/chunk-$chunkIndex").apply { mkdirs() }
+        val fragFile = File(fragDir, "fragment-$fragmentIndex.bin")
+        fragFile.writeBytes(bytes)
+
+        // Check if all fragments present
+        val files = fragDir.listFiles()?.filter { it.name.startsWith("fragment-") } ?: emptyList()
+        if (files.size < totalFragments) return null
+
+        // Assemble fragments in order
+        val assembled = File(transferDir, "chunk-$chunkIndex.bin")
+        assembled.outputStream().use { out ->
+            (0 until totalFragments).forEach { idx ->
+                val part = File(fragDir, "fragment-$idx.bin")
+                if (!part.exists()) throw IllegalStateException("Missing fragment $idx")
+                out.write(part.readBytes())
+            }
+        }
+        // Cleanup fragment files
+        try {
+            files.forEach { it.delete() }
+            fragDir.delete()
+        } catch (_: Exception) {
+            // best-effort
+        }
+        return assembled.absolutePath
     }
 
     override fun deleteTransferFiles(transferId: String) {

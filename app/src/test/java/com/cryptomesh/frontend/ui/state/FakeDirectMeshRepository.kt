@@ -63,4 +63,8 @@ class FakeDirectMeshRepository(
         return sendFailure?.let(Result.Companion::failure)
             ?: Result.success("media-transfer-test")
     }
+
+    override suspend fun retryOutgoingTransfer(transferId: String): Result<Unit> {
+        return Result.success(Unit)
+    }
 }

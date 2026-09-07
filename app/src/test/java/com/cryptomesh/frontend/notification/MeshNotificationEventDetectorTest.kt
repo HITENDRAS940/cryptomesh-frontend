@@ -235,7 +235,8 @@ class MeshNotificationEventDetectorTest {
             totalChunks = 1,
             isOutgoing = outgoing,
             status = status,
-            outputPath = null
+            outputPath = null,
+            createdAtEpochMillis = 1L
         )
     }
 

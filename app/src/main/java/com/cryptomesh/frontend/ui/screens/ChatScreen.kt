@@ -1,14 +1,20 @@
 package com.cryptomesh.frontend.ui.screens
 
 import android.content.Context
+import android.content.Intent
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
+import android.media.MediaMetadataRetriever
 import android.net.Uri
 import android.provider.OpenableColumns
+import android.webkit.MimeTypeMap
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.slideInVertically
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
@@ -19,6 +25,7 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.ime
 import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.padding
@@ -28,6 +35,7 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
@@ -36,14 +44,19 @@ import androidx.compose.material.icons.automirrored.filled.Send
 import androidx.compose.material.icons.filled.AttachFile
 import androidx.compose.material.icons.filled.AudioFile
 import androidx.compose.material.icons.filled.Check
+import androidx.compose.material.icons.filled.Description
 import androidx.compose.material.icons.filled.DoneAll
 import androidx.compose.material.icons.filled.ErrorOutline
 import androidx.compose.material.icons.filled.Image
 import androidx.compose.material.icons.filled.Lock
+import androidx.compose.material.icons.filled.PauseCircle
+import androidx.compose.material.icons.filled.PictureAsPdf
+import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Schedule
 import androidx.compose.material.icons.filled.VideoFile
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.IconButtonDefaults
@@ -64,15 +77,21 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.core.content.FileProvider
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import com.cryptomesh.frontend.data.repository.MediaTransferStatus
+import com.cryptomesh.frontend.protocol.MediaKind
 import com.cryptomesh.frontend.ui.components.EmptyState
 import com.cryptomesh.frontend.ui.components.MainTabHeader
 import com.cryptomesh.frontend.ui.components.ScreenHeader
@@ -83,7 +102,7 @@ import com.cryptomesh.frontend.ui.state.ConversationUiModel
 import com.cryptomesh.frontend.ui.state.MediaAttachmentUiModel
 import com.cryptomesh.frontend.ui.state.MediaTransferUiModel
 import com.cryptomesh.frontend.ui.state.MessageDeliveryStatus
-import com.cryptomesh.frontend.protocol.MediaKind
+import java.io.File
 import java.util.Locale
 
 @Composable
@@ -137,11 +156,19 @@ fun ChatScreen(viewModel: ChatViewModel) {
                 onBack = viewModel::closeConversation,
                 onComposerChange = viewModel::updateComposer,
                 onAttach = {
-                    mediaPicker.launch(arrayOf("image/*", "video/*", "audio/*"))
+                    mediaPicker.launch(
+                        arrayOf(
+                            "image/*",
+                            "video/*",
+                            "audio/*",
+                            "application/pdf"
+                        )
+                    )
                 },
                 onClearAttachment = viewModel::clearAttachment,
                 onSend = viewModel::sendMessage,
                 onRetry = viewModel::retryMessage,
+                onMediaRetry = viewModel::retryMedia,
                 modifier = Modifier.padding(padding)
             )
         }
@@ -275,6 +302,25 @@ private fun ConversationCard(
     }
 }
 
+private sealed interface ConversationTimelineItem {
+    val id: String
+    val createdAtEpochMillis: Long
+}
+
+private data class MessageTimelineItem(
+    val message: ChatMessageUiModel
+) : ConversationTimelineItem {
+    override val id: String = message.id
+    override val createdAtEpochMillis: Long = message.createdAtEpochMillis
+}
+
+private data class TransferTimelineItem(
+    val transfer: MediaTransferUiModel
+) : ConversationTimelineItem {
+    override val id: String = transfer.id
+    override val createdAtEpochMillis: Long = transfer.createdAtEpochMillis
+}
+
 @Composable
 private fun ConversationThread(
     conversation: ConversationUiModel,
@@ -286,15 +332,25 @@ private fun ConversationThread(
     onClearAttachment: () -> Unit,
     onSend: () -> Unit,
     onRetry: (String) -> Unit,
+    onMediaRetry: (String) -> Unit,
     modifier: Modifier = Modifier
 ) {
     val listState = rememberLazyListState()
     val density = LocalDensity.current
+    val context = LocalContext.current
     val isKeyboardVisible = WindowInsets.ime.getBottom(density) > 0
+    val timeline = remember(
+        conversation.messages,
+        conversation.mediaTransfers
+    ) {
+        (conversation.messages.map(::MessageTimelineItem) +
+            conversation.mediaTransfers.map(::TransferTimelineItem))
+            .sortedBy(ConversationTimelineItem::createdAtEpochMillis)
+    }
 
-    LaunchedEffect(conversation.messages.size, isKeyboardVisible) {
-        if (conversation.messages.isNotEmpty()) {
-            listState.animateScrollToItem(conversation.messages.lastIndex)
+    LaunchedEffect(timeline.size, isKeyboardVisible) {
+        if (timeline.isNotEmpty()) {
+            listState.animateScrollToItem(timeline.lastIndex)
         }
     }
 
@@ -325,7 +381,7 @@ private fun ConversationThread(
                     )
                 }
             )
-            if (conversation.messages.isEmpty()) {
+            if (conversation.messages.isEmpty() && conversation.mediaTransfers.isEmpty()) {
                 Box(
                     modifier = Modifier
                         .weight(1f)
@@ -351,19 +407,24 @@ private fun ConversationThread(
                     verticalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
                     items(
-                        conversation.mediaTransfers,
-                        key = MediaTransferUiModel::id
-                    ) { transfer ->
-                        MediaTransferCard(transfer)
-                    }
-                    items(
-                        conversation.messages,
-                        key = ChatMessageUiModel::id
-                    ) { message ->
-                        AnimatedMessageBubble(
-                            message = message,
-                            onRetry = { onRetry(message.id) }
-                        )
+                        items = timeline,
+                        key = { item -> item.id }
+                    ) { item ->
+                        when (item) {
+                            is MessageTimelineItem -> AnimatedMessageBubble(
+                                message = item.message,
+                                onRetry = { onRetry(item.message.id) }
+                            )
+                            is TransferTimelineItem -> MediaTransferCard(
+                                transfer = item.transfer,
+                                onRetry = { transferId ->
+                                    onMediaRetry(transferId)
+                                },
+                                onOpen = {
+                                    openTransferFile(context, item.transfer)
+                                }
+                            )
+                        }
                     }
                 }
             }
@@ -588,52 +649,274 @@ private fun SelectedAttachmentRow(
 }
 
 @Composable
-private fun MediaTransferCard(transfer: MediaTransferUiModel) {
+private fun MediaTransferCard(
+    transfer: MediaTransferUiModel,
+    onRetry: (String) -> Unit,
+    onOpen: () -> Unit
+) {
+    val openEnabled = transfer.status == MediaTransferStatus.Completed &&
+        !transfer.outputPath.isNullOrBlank()
+    val showPreview = !transfer.outputPath.isNullOrBlank() &&
+        (transfer.mediaKind == MediaKind.Photo ||
+            transfer.mediaKind == MediaKind.Video ||
+            transfer.mediaKind == MediaKind.Document)
+    Box(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(vertical = 2.dp)
+    ) {
+        Surface(
+            modifier = Modifier
+                .fillMaxWidth()
+                .then(
+                    if (openEnabled) Modifier.clickable(onClick = onOpen) else Modifier
+                ),
+            color = MaterialTheme.colorScheme.surfaceContainer,
+            shape = MaterialTheme.shapes.medium
+        ) {
+            Column(
+                modifier = Modifier.padding(12.dp),
+                verticalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(10.dp)
+                ) {
+                    Icon(
+                        mediaIcon(transfer.mediaKind),
+                        contentDescription = null,
+                        tint = MaterialTheme.colorScheme.primary
+                    )
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(
+                            transfer.fileName,
+                            style = MaterialTheme.typography.titleSmall,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                        Text(
+                            "${formatFileSize(transfer.sizeBytes)} | " +
+                                transfer.status.name,
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                }
+                if (showPreview) {
+                    MediaTransferPreview(transfer = transfer, onOpen = onOpen)
+                }
+                LinearProgressIndicator(
+                    progress = { transfer.progress },
+                    modifier = Modifier.fillMaxWidth()
+                )
+                Text(
+                    transfer.progressText,
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+
+                if (transfer.status == MediaTransferStatus.Failed) {
+                    OutlinedButton(onClick = { onRetry(transfer.id) }) {
+                        Text("Retry")
+                    }
+                }
+            }
+        }
+
+        if (transfer.status == MediaTransferStatus.Offered ||
+            transfer.status == MediaTransferStatus.Transferring ||
+            transfer.status == MediaTransferStatus.Receiving
+        ) {
+            Box(
+                modifier = Modifier
+                    .matchParentSize(),
+                contentAlignment = Alignment.Center
+            ) {
+                Box(
+                    modifier = Modifier
+                        .matchParentSize()
+                        .background(Color(0x88000000))
+                )
+                CircularProgressIndicator()
+            }
+        }
+    }
+}
+
+@Composable
+private fun MediaTransferPreview(
+    transfer: MediaTransferUiModel,
+    onOpen: () -> Unit
+) {
+    val thumbnail = remember(transfer.outputPath) {
+        transfer.outputPath?.let { path ->
+            buildMediaPreviewBitmap(path, transfer.mediaKind)
+        }
+    }
     Surface(
         modifier = Modifier
             .fillMaxWidth()
-            .padding(vertical = 2.dp),
-        color = MaterialTheme.colorScheme.surfaceContainer,
-        shape = MaterialTheme.shapes.medium
+            .heightIn(min = 120.dp, max = 220.dp)
+            .clip(RoundedCornerShape(12.dp))
+            .clickable(onClick = onOpen),
+        color = MaterialTheme.colorScheme.background,
+        tonalElevation = 1.dp
     ) {
-        Column(
-            modifier = Modifier.padding(12.dp),
-            verticalArrangement = Arrangement.spacedBy(8.dp)
-        ) {
-            Row(
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(10.dp)
-            ) {
-                Icon(
-                    mediaIcon(transfer.mediaKind),
-                    contentDescription = null,
-                    tint = MaterialTheme.colorScheme.primary
-                )
-                Column(modifier = Modifier.weight(1f)) {
-                    Text(
-                        transfer.fileName,
-                        style = MaterialTheme.typography.titleSmall,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis
+        when (transfer.mediaKind) {
+            MediaKind.Photo -> {
+                if (thumbnail != null) {
+                    Image(
+                        bitmap = thumbnail.asImageBitmap(),
+                        contentDescription = "Preview of ${transfer.fileName}",
+                        modifier = Modifier.fillMaxSize(),
+                        contentScale = ContentScale.Crop
                     )
-                    Text(
-                        "${formatFileSize(transfer.sizeBytes)} | " +
-                            transfer.status.name,
-                        style = MaterialTheme.typography.labelSmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                } else {
+                    FilePlaceholder(
+                        icon = Icons.Default.Image,
+                        title = "Open photo",
+                        subtitle = transfer.fileName
                     )
                 }
             }
-            LinearProgressIndicator(
-                progress = { transfer.progress },
-                modifier = Modifier.fillMaxWidth()
+            MediaKind.Video -> {
+                if (thumbnail != null) {
+                    Box(modifier = Modifier.fillMaxSize()) {
+                        Image(
+                            bitmap = thumbnail.asImageBitmap(),
+                            contentDescription = "Preview of ${transfer.fileName}",
+                            modifier = Modifier.fillMaxSize(),
+                            contentScale = ContentScale.Crop
+                        )
+                        Surface(
+                            modifier = Modifier
+                                .align(Alignment.Center)
+                                .size(48.dp),
+                            shape = CircleShape,
+                            color = Color(0x88000000)
+                        ) {
+                            Box(contentAlignment = Alignment.Center) {
+                                Icon(
+                                    Icons.Default.PlayArrow,
+                                    contentDescription = null,
+                                    tint = Color.White
+                                )
+                            }
+                        }
+                    }
+                } else {
+                    FilePlaceholder(
+                        icon = Icons.Default.VideoFile,
+                        title = "Open video",
+                        subtitle = transfer.fileName
+                    )
+                }
+            }
+            MediaKind.Audio -> {
+                FilePlaceholder(
+                    icon = Icons.Default.AudioFile,
+                    title = "Open audio",
+                    subtitle = transfer.fileName
+                )
+            }
+            MediaKind.Document -> {
+                FilePlaceholder(
+                    icon = Icons.Default.PictureAsPdf,
+                    title = "Open PDF",
+                    subtitle = transfer.fileName
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun FilePlaceholder(
+    icon: ImageVector,
+    title: String,
+    subtitle: String
+) {
+    Box(
+        modifier = Modifier.fillMaxSize(),
+        contentAlignment = Alignment.Center
+    ) {
+        Column(
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            Icon(
+                imageVector = icon,
+                contentDescription = null,
+                tint = MaterialTheme.colorScheme.primary
             )
             Text(
-                transfer.progressText,
+                title,
+                style = MaterialTheme.typography.titleSmall,
+                fontWeight = FontWeight.SemiBold
+            )
+            Text(
+                subtitle,
                 style = MaterialTheme.typography.labelSmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
             )
         }
+    }
+}
+
+private fun openTransferFile(context: Context, transfer: MediaTransferUiModel) {
+    val outputPath = transfer.outputPath ?: return
+    val file = File(outputPath)
+    if (!file.exists()) return
+
+    val mimeType = transfer.mimeType.ifBlank {
+        MimeTypeMap.getSingleton().getMimeTypeFromExtension(file.extension)
+            ?: "application/octet-stream"
+    }
+
+    val uri = FileProvider.getUriForFile(
+        context,
+        "${context.packageName}.fileprovider",
+        file
+    )
+    val intent = Intent(Intent.ACTION_VIEW).apply {
+        setDataAndType(uri, mimeType)
+        addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        addCategory(Intent.CATEGORY_BROWSABLE)
+    }
+
+    val chooser = Intent.createChooser(
+        intent,
+        "Open ${transfer.fileName}"
+    )
+    chooser.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+    runCatching {
+        context.startActivity(chooser)
+    }
+}
+
+private fun buildMediaPreviewBitmap(
+    path: String,
+    mediaKind: MediaKind
+): Bitmap? {
+    val file = File(path)
+    if (!file.exists()) return null
+    return when (mediaKind) {
+        MediaKind.Photo -> {
+            BitmapFactory.decodeFile(file.absolutePath)
+        }
+        MediaKind.Video -> {
+            runCatching {
+                val retriever = MediaMetadataRetriever()
+                retriever.setDataSource(file.absolutePath)
+                val bitmap = retriever.frameAtTime
+                retriever.release()
+                bitmap
+            }.getOrNull()
+        }
+        MediaKind.Audio -> null
+        MediaKind.Document -> null
     }
 }
 
@@ -652,12 +935,6 @@ private fun readMediaAttachment(
 ): PickedMediaAttachment? {
     val resolver = context.contentResolver
     val mimeType = resolver.getType(uri) ?: return null
-    val mediaKind = when {
-        mimeType.startsWith("image/") -> MediaKind.Photo
-        mimeType.startsWith("video/") -> MediaKind.Video
-        mimeType.startsWith("audio/") -> MediaKind.Audio
-        else -> return null
-    }
     val metadata = resolver.query(
         uri,
         arrayOf(
@@ -683,12 +960,20 @@ private fun readMediaAttachment(
         }
         name to size
     }
+    val fileName = metadata?.first ?: "media"
+    val mediaKind = when {
+        mimeType.startsWith("image/") -> MediaKind.Photo
+        mimeType.startsWith("video/") -> MediaKind.Video
+        mimeType.startsWith("audio/") -> MediaKind.Audio
+        mimeType == "application/pdf" || fileName.endsWith(".pdf", ignoreCase = true) -> MediaKind.Document
+        else -> return null
+    }
     val bytes = resolver.openInputStream(uri)?.use { it.readBytes() }
         ?: return null
     return PickedMediaAttachment(
         uri = uri.toString(),
         mediaKind = mediaKind,
-        fileName = metadata?.first ?: "media",
+        fileName = fileName,
         mimeType = mimeType,
         sizeBytes = metadata?.second?.takeIf { it > 0 } ?: bytes.size.toLong(),
         bytes = bytes
@@ -700,6 +985,7 @@ private fun mediaIcon(kind: MediaKind): ImageVector {
         MediaKind.Photo -> Icons.Default.Image
         MediaKind.Video -> Icons.Default.VideoFile
         MediaKind.Audio -> Icons.Default.AudioFile
+        MediaKind.Document -> Icons.Default.PictureAsPdf
     }
 }
 

@@ -30,7 +30,8 @@ data class MediaTransferUiModel(
     val progress: Float,
     val isOutgoing: Boolean,
     val status: MediaTransferStatus,
-    val outputPath: String?
+    val outputPath: String?,
+    val createdAtEpochMillis: Long
 )
 
 data class ChatMessageUiModel(
@@ -38,7 +39,8 @@ data class ChatMessageUiModel(
     val text: String,
     val timestamp: String,
     val isOutgoing: Boolean,
-    val deliveryStatus: MessageDeliveryStatus?
+    val deliveryStatus: MessageDeliveryStatus?,
+    val createdAtEpochMillis: Long
 )
 
 data class ConversationUiModel(

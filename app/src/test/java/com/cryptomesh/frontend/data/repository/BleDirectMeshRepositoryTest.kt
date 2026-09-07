@@ -376,7 +376,7 @@ class BleDirectMeshRepositoryTest {
                 aliceFinal.mediaTransfers.single().status
             )
             assertTrue(
-                bobPackets.packetTypes().contains("MediaChunk")
+                bobPackets.packetTypes().any { it == "MediaChunk" || it == "MediaFragment" }
             )
 
             aliceScope.cancel()

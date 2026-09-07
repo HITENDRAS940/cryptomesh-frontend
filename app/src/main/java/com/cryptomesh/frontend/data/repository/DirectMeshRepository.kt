@@ -24,6 +24,7 @@ import com.cryptomesh.frontend.transport.NearbyTransportEvent
 import com.cryptomesh.frontend.transport.TransportLinkStatus
 import com.cryptomesh.frontend.transport.TransportUnavailableReason
 import com.cryptomesh.frontend.ui.state.LocalIdentity
+import java.io.File
 import java.util.Base64
 import java.util.concurrent.ConcurrentHashMap
 import kotlinx.coroutines.CoroutineScope
@@ -82,7 +83,8 @@ data class DirectMediaTransfer(
     val totalChunks: Int,
     val isOutgoing: Boolean,
     val status: MediaTransferStatus,
-    val outputPath: String? = null
+    val outputPath: String? = null,
+    val createdAtEpochMillis: Long
 )
 
 data class DirectMeshState(
@@ -118,6 +120,12 @@ interface DirectMeshRepository {
         mimeType: String,
         bytes: ByteArray
     ): Result<String>
+
+    // Retry a previously-created outgoing transfer. If the transfer has already
+    // encrypted chunk files on disk (from a prior attempt), this will re-send
+    // the offer and forward those encrypted chunks again. Returns failure if
+    // the transfer cannot be retried (missing files, not outgoing, etc.).
+    suspend fun retryOutgoingTransfer(transferId: String): Result<Unit>
 }
 
 class BleDirectMeshRepository(
@@ -262,6 +270,16 @@ class BleDirectMeshRepository(
             bytes = bytes
         )
 
+        val previewPath = try {
+            mediaFileStore.writeCompletedMedia(
+                transferId = prepared.offer.transferId,
+                fileName = prepared.offer.fileName,
+                bytes = prepared.previewBytes
+            )
+        } catch (_: Exception) {
+            null
+        }
+
         // Persist transfer metadata immediately so UI can show a preview in-chat
         mediaTransferRepository.upsertTransfer(
             StoredMediaTransfer(
@@ -278,7 +296,7 @@ class BleDirectMeshRepository(
                 encryptedTransferKeyBase64 =
                     prepared.offer.encryptedTransferKeyBase64,
                 sourceUri = null,
-                outputPath = null,
+                outputPath = previewPath,
                 status = MediaTransferStatus.Offered,
                 createdAtEpochMillis = prepared.offer.createdAtEpochMillis,
                 expiresAtEpochMillis = prepared.offer.expiresAtEpochMillis,
@@ -668,6 +686,10 @@ class BleDirectMeshRepository(
                     receiveMediaChunk(envelope, plaintext)
                 }
 
+                SecurePacketType.MediaFragment -> {
+                    receiveMediaFragment(envelope, plaintext)
+                }
+
                 SecurePacketType.MediaChunkAcknowledgement -> {
                     receiveMediaChunkAcknowledgement(plaintext)
                 }
@@ -826,6 +848,73 @@ class BleDirectMeshRepository(
         )
     }
 
+    private suspend fun receiveMediaFragment(
+        envelope: SecurePacketEnvelope,
+        plaintext: ByteArray
+    ) {
+        val payload = wireCodec.decodeMediaFragment(plaintext)
+        val transfer = mediaTransferRepository.getTransfer(payload.transferId) ?: return
+        // write fragment and attempt assembly
+        val assembledPath = try {
+            mediaFileStore.writeEncryptedFragment(
+                transferId = payload.transferId,
+                chunkIndex = payload.chunkIndex,
+                fragmentIndex = payload.fragmentIndex,
+                totalFragments = payload.totalFragments,
+                bytes = payload.encryptedFragmentBase64.fromBase64()
+            )
+        } catch (_: Exception) {
+            null
+        }
+        if (assembledPath != null) {
+            // assembled, verify and persist chunk
+            val transferKey = transfer.encryptedTransferKeyBase64.fromBase64()
+            // Build a MediaChunkPayload to verify integrity
+        val encryptedBytes = mediaFileStore.readEncryptedChunk(assembledPath)
+        val reconstructedPayload = MediaChunkPayload(
+            transferId = payload.transferId,
+            chunkIndex = payload.chunkIndex,
+            totalChunks = transfer.totalChunks,
+            offsetBytes = payload.offsetBytes,
+            chunkSizeBytes = payload.chunkSizeBytes,
+            chunkSha256Base64 = payload.chunkSha256Base64,
+            encryptedChunkBase64 = encryptedBytes.toBase64()
+        )
+        // Validate by attempting to open chunk (may throw)
+        try {
+            mediaTransferEngine.openChunk(transferKey, reconstructedPayload)
+            mediaTransferRepository.upsertChunk(
+                StoredMediaChunk(
+                    transferId = reconstructedPayload.transferId,
+                    chunkIndex = reconstructedPayload.chunkIndex,
+                    packetId = envelope.packetId,
+                    offsetBytes = reconstructedPayload.offsetBytes,
+                    sizeBytes = reconstructedPayload.chunkSizeBytes,
+                    chunkSha256Base64 = reconstructedPayload.chunkSha256Base64,
+                    encryptedPath = assembledPath,
+                    plaintextPath = null,
+                    status = MediaChunkStatus.Verified,
+                    lastUpdatedEpochMillis = now()
+                )
+            )
+            sendMediaChunkAcknowledgement(
+                receiverDeviceId = envelope.senderId,
+                transferId = reconstructedPayload.transferId,
+                chunkIndex = reconstructedPayload.chunkIndex,
+                expiresAtEpochMillis = transfer.expiresAtEpochMillis
+            )
+            completeTransferIfReady(transfer)
+        } catch (_: Exception) {
+            // if verification fails, mark chunk failed
+            mediaTransferRepository.updateChunkStatus(
+                transferId = payload.transferId,
+                chunkIndex = payload.chunkIndex,
+                status = MediaChunkStatus.Failed
+            )
+        }
+        }
+    }
+
     private suspend fun completeTransferIfReady(
         transfer: StoredMediaTransfer
     ) {
@@ -905,6 +994,23 @@ class BleDirectMeshRepository(
                 transferId = acknowledgement.transferId,
                 chunkIndex = chunkIndex,
                 status = MediaChunkStatus.Sent
+            )
+        }
+        finalizeOutgoingTransferIfAcknowledged(acknowledgement.transferId)
+    }
+
+    private suspend fun finalizeOutgoingTransferIfAcknowledged(
+        transferId: String
+    ) {
+        val transfer = mediaTransferRepository.getTransfer(transferId) ?: return
+        val chunks = mediaTransferRepository.chunksForTransfer(transferId)
+        if (chunks.isEmpty()) return
+        if (chunks.all { it.status == MediaChunkStatus.Sent } &&
+            transfer.totalChunks == chunks.size
+        ) {
+            mediaTransferRepository.updateTransferStatus(
+                transferId,
+                MediaTransferStatus.Completed
             )
         }
     }
@@ -1077,7 +1183,7 @@ class BleDirectMeshRepository(
         receiverDeviceId: String,
         senderDeviceId: String
     ) {
-        // Attempt to send offer and chunks in background, updating DB state as we go.
+        // Throttle chunk sends and ensure an active session exists for each send.
         try {
             mediaTransferRepository.updateTransferStatus(
                 prepared.offer.transferId,
@@ -1102,13 +1208,25 @@ class BleDirectMeshRepository(
                 return
             }
 
-            // Iterate chunks: seal, write file, forward, and mark Sent
+            // Iterate chunks: seal, write file, forward, and mark Sent.
+            // Insert a small delay between sends to avoid saturating transport.
+            val chunkDelayMs = 100L
             prepared.chunks.forEach { chunk ->
+                // If authenticated session is lost, abort and mark failed.
+                if (currentSessionFor(receiverDeviceId) == null) {
+                    mediaTransferRepository.updateTransferStatus(
+                        prepared.offer.transferId,
+                        MediaTransferStatus.Failed
+                    )
+                    return
+                }
+
                 val payload = mediaTransferEngine.sealChunk(
                     transferKey = prepared.transferKey,
                     chunk = chunk,
                     totalChunks = prepared.offer.totalChunks
                 )
+
                 val encryptedPath = try {
                     mediaFileStore.writeEncryptedChunk(
                         transferId = chunk.transferId,
@@ -1119,15 +1237,72 @@ class BleDirectMeshRepository(
                     null
                 }
 
-                val packetId = runCatching {
-                    sealAndForwardMediaPacket(
-                        packetType = SecurePacketType.MediaChunk,
-                        senderId = senderDeviceId,
-                        receiverId = receiverDeviceId,
-                        payload = wireCodec.encodeMediaChunk(payload),
-                        expiresAtEpochMillis = prepared.offer.expiresAtEpochMillis
+                // Fragment the encrypted payload to BLE-friendly fragments and send as MediaFragment packets
+                val encryptedBytes = payload.encryptedChunkBase64.fromBase64()
+                val fragmentSize = 1024 // BLE-friendly fragment size
+                val totalFragments = (encryptedBytes.size + fragmentSize - 1) / fragmentSize
+                var lastPacketId: String? = null
+                var assembledPath: String? = null
+                for (fragmentIndex in 0 until totalFragments) {
+                    val start = fragmentIndex * fragmentSize
+                    val end = minOf(start + fragmentSize, encryptedBytes.size)
+                    val fragmentBytes = encryptedBytes.copyOfRange(start, end)
+                    val fragmentPayload = com.cryptomesh.frontend.protocol.MediaFragmentPayload(
+                        transferId = payload.transferId,
+                        chunkIndex = payload.chunkIndex,
+                        offsetBytes = chunk.offsetBytes,
+                        chunkSizeBytes = payload.chunkSizeBytes,
+                        fragmentIndex = fragmentIndex,
+                        totalFragments = totalFragments,
+                        chunkSha256Base64 = payload.chunkSha256Base64,
+                        encryptedFragmentBase64 = fragmentBytes.toBase64()
                     )
-                }.getOrNull()
+                    val fragPacketId = runCatching {
+                        sealAndForwardMediaPacket(
+                            packetType = SecurePacketType.MediaFragment,
+                            senderId = senderDeviceId,
+                            receiverId = receiverDeviceId,
+                            payload = wireCodec.encodeMediaFragment(fragmentPayload),
+                            expiresAtEpochMillis = prepared.offer.expiresAtEpochMillis
+                        )
+                    }.getOrNull()
+
+                    lastPacketId = fragPacketId ?: lastPacketId
+                    if (fragPacketId == null) {
+                        mediaTransferRepository.updateChunkStatus(
+                            transferId = chunk.transferId,
+                            chunkIndex = chunk.chunkIndex,
+                            status = MediaChunkStatus.Failed
+                        )
+                        mediaTransferRepository.updateTransferStatus(
+                            prepared.offer.transferId,
+                            MediaTransferStatus.Failed
+                        )
+                        return
+                    }
+
+                    // Save fragment to disk as we go (best-effort) and capture assembled path if assembly completes
+                    var assembledSoFar: String? = null
+                    try {
+                        val maybeAssembled = mediaFileStore.writeEncryptedFragment(
+                            transferId = chunk.transferId,
+                            chunkIndex = chunk.chunkIndex,
+                            fragmentIndex = fragmentIndex,
+                            totalFragments = totalFragments,
+                            bytes = fragmentBytes
+                        )
+                        if (maybeAssembled != null) assembledPath = maybeAssembled
+                    } catch (_: Exception) {
+                        // ignore write failures
+                    }
+
+                    // small delay between fragments
+                    try { kotlinx.coroutines.delay(50L) } catch (_: Exception) {}
+                }
+
+                // After all fragments sent, assembledPath may have been set during fragment writes
+                // Use last fragment's packet id as representative packet id for the chunk
+                val packetId = lastPacketId
 
                 // Update chunk storage with packet id and file path and mark Sent (or Failed)
                 if (packetId != null) {
@@ -1136,7 +1311,7 @@ class BleDirectMeshRepository(
                         chunkIndex = chunk.chunkIndex,
                         packetId = packetId,
                         status = MediaChunkStatus.Sent,
-                        encryptedPath = encryptedPath,
+                        encryptedPath = assembledPath ?: encryptedPath,
                         plaintextPath = null
                     )
                 } else {
@@ -1151,9 +1326,16 @@ class BleDirectMeshRepository(
                     )
                     return
                 }
+
+                // Yield to the scheduler and avoid transport saturation
+                try {
+                    kotlinx.coroutines.delay(chunkDelayMs)
+                } catch (_: Exception) {
+                    // ignore cancellation during delay
+                }
             }
 
-            // Mark transfer as transferring — waiting for remote side to ACK/complete
+            // All chunks forwarded; remain in Transferring awaiting remote ACK/complete
             mediaTransferRepository.updateTransferStatus(
                 prepared.offer.transferId,
                 MediaTransferStatus.Transferring
@@ -1182,6 +1364,115 @@ class BleDirectMeshRepository(
                     session.peerSigningPublicKey
                 ).getOrNull()
             }
+    }
+
+    override suspend fun retryOutgoingTransfer(transferId: String): Result<Unit> = runCatching {
+        val transfer = mediaTransferRepository.getTransfer(transferId)
+            ?: error("Transfer not found.")
+        if (transfer.direction != MediaTransferDirection.Outgoing) {
+            error("Can only retry outgoing transfers.")
+        }
+
+        val identity = localIdentity ?: error("Local identity not ready.")
+
+        // Build offer payload from stored transfer record
+        val offer = MediaOfferPayload(
+            transferId = transfer.transferId,
+            mediaKind = transfer.mediaKind,
+            fileName = transfer.fileName,
+            mimeType = transfer.mimeType,
+            sizeBytes = transfer.sizeBytes,
+            chunkSizeBytes = transfer.chunkSizeBytes,
+            totalChunks = transfer.totalChunks,
+            fileSha256Base64 = transfer.fileSha256Base64,
+            encryptedTransferKeyBase64 = transfer.encryptedTransferKeyBase64,
+            createdAtEpochMillis = transfer.createdAtEpochMillis,
+            expiresAtEpochMillis = transfer.expiresAtEpochMillis
+        )
+
+        // Mark transfer as transferring in DB
+        mediaTransferRepository.updateTransferStatus(
+            transferId,
+            MediaTransferStatus.Transferring
+        )
+
+        // Ensure there is an active session before attempting retry
+        if (currentSessionFor(transfer.peerDeviceId) == null) {
+            error("No active authenticated session for peer ${transfer.peerDeviceId}.")
+        }
+
+        // Send MediaOffer
+        val offerSent = runCatching {
+            sealAndForwardMediaPacket(
+                packetType = SecurePacketType.MediaOffer,
+                senderId = identity.deviceId,
+                receiverId = transfer.peerDeviceId,
+                payload = wireCodec.encodeMediaOffer(offer),
+                expiresAtEpochMillis = transfer.expiresAtEpochMillis
+            )
+        }
+        if (offerSent.isFailure) {
+            mediaTransferRepository.updateTransferStatus(
+                transferId,
+                MediaTransferStatus.Failed
+            )
+            error("Failed to send media offer.")
+        }
+
+        // Iterate existing chunk files (encrypted) and forward them.
+        val chunks = mediaTransferRepository.chunksForTransfer(transferId)
+        chunks.forEach { chunk ->
+            val encryptedPath = chunk.encryptedPath
+                ?: error("Missing encrypted chunk file for index ${chunk.chunkIndex}.")
+            val encryptedBytes = mediaFileStore.readEncryptedChunk(encryptedPath)
+            val payload = MediaChunkPayload(
+                transferId = chunk.transferId,
+                chunkIndex = chunk.chunkIndex,
+                totalChunks = transfer.totalChunks,
+                offsetBytes = chunk.offsetBytes,
+                chunkSizeBytes = chunk.sizeBytes,
+                chunkSha256Base64 = chunk.chunkSha256Base64,
+                encryptedChunkBase64 = encryptedBytes.toBase64()
+            )
+
+            val packetId = runCatching {
+                sealAndForwardMediaPacket(
+                    packetType = SecurePacketType.MediaChunk,
+                    senderId = identity.deviceId,
+                    receiverId = transfer.peerDeviceId,
+                    payload = wireCodec.encodeMediaChunk(payload),
+                    expiresAtEpochMillis = transfer.expiresAtEpochMillis
+                )
+            }.getOrNull()
+
+            if (packetId != null) {
+                mediaTransferRepository.updateChunkStorage(
+                    transferId = chunk.transferId,
+                    chunkIndex = chunk.chunkIndex,
+                    packetId = packetId,
+                    status = MediaChunkStatus.Sent,
+                    encryptedPath = encryptedPath,
+                    plaintextPath = null
+                )
+            } else {
+                mediaTransferRepository.updateChunkStatus(
+                    transferId = chunk.transferId,
+                    chunkIndex = chunk.chunkIndex,
+                    status = MediaChunkStatus.Failed
+                )
+                mediaTransferRepository.updateTransferStatus(
+                    transferId,
+                    MediaTransferStatus.Failed
+                )
+                error("Failed to send chunk ${chunk.chunkIndex}.")
+            }
+        }
+
+        // All chunks forwarded, remain in Transferring state awaiting remote
+        mediaTransferRepository.updateTransferStatus(
+            transferId,
+            MediaTransferStatus.Transferring
+        )
     }
 
     private suspend fun flushPacketsForLink(linkId: String) {
@@ -1385,8 +1676,9 @@ private fun StoredMediaTransfer.toDirectMediaTransfer(): DirectMediaTransfer {
         totalChunks = totalChunks,
         isOutgoing = direction == MediaTransferDirection.Outgoing,
         status = status,
-        outputPath = outputPath
-    )
+    outputPath = outputPath,
+    createdAtEpochMillis = createdAtEpochMillis
+)
 }
 
 private fun ByteArray.toBase64(): String {

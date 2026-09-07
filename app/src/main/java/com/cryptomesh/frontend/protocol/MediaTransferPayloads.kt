@@ -6,7 +6,8 @@ import kotlinx.serialization.Serializable
 enum class MediaKind {
     Photo,
     Video,
-    Audio
+    Audio,
+    Document
 }
 
 @Serializable
@@ -59,6 +60,18 @@ data class MediaChunkPayload(
     val chunkSizeBytes: Int,
     val chunkSha256Base64: String,
     val encryptedChunkBase64: String
+)
+
+@Serializable
+data class MediaFragmentPayload(
+    val transferId: String,
+    val chunkIndex: Int,
+    val offsetBytes: Long,
+    val chunkSizeBytes: Int,
+    val fragmentIndex: Int,
+    val totalFragments: Int,
+    val chunkSha256Base64: String,
+    val encryptedFragmentBase64: String
 )
 
 @Serializable

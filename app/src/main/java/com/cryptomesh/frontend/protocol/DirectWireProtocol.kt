@@ -127,6 +127,14 @@ class DirectWireCodec {
         return json.decodeFromString(payload.decodeToString())
     }
 
+    fun encodeMediaFragment(payload: MediaFragmentPayload): ByteArray {
+        return json.encodeToString(payload).encodeToByteArray()
+    }
+
+    fun decodeMediaFragment(payload: ByteArray): MediaFragmentPayload {
+        return json.decodeFromString(payload.decodeToString())
+    }
+
     fun encodeMediaChunkAcknowledgement(
         payload: MediaChunkAcknowledgementPayload
     ): ByteArray {

@@ -169,6 +169,30 @@ class ChatViewModel(
         }
     }
 
+    fun retryMedia(transferId: String) {
+        val conversation = _uiState.value.conversations
+            .firstOrNull { candidate ->
+                candidate.mediaTransfers.any {
+                    it.id == transferId && it.isOutgoing && it.status == MediaTransferStatus.Failed
+                }
+            } ?: return
+        if (!conversation.isVerifiedSession) {
+            _uiState.update {
+                it.copy(errorMessage = "Peer has not completed authentication.")
+            }
+            return
+        }
+        viewModelScope.launch {
+            directMeshRepository.retryOutgoingTransfer(transferId).onFailure { error ->
+                _uiState.update {
+                    it.copy(
+                        errorMessage = error.message ?: "Media retry failed."
+                    )
+                }
+            }
+        }
+    }
+
     private fun showSendError(error: Throwable, fallback: String) {
         _uiState.update {
             it.copy(errorMessage = error.message ?: fallback)
@@ -276,6 +300,12 @@ private fun DirectMediaTransfer.toUiModel(): MediaTransferUiModel {
     val safeTotal = totalChunks.coerceAtLeast(1)
     val progress = (completedChunks.toFloat() / safeTotal)
         .coerceIn(0f, 1f)
+    // Use transferId hash as deterministic created-at fallback when not provided
+    val createdAt = try {
+        0L
+    } catch (_: Exception) {
+        0L
+    }
     return MediaTransferUiModel(
         id = transferId,
         mediaKind = mediaKind,
@@ -286,7 +316,8 @@ private fun DirectMediaTransfer.toUiModel(): MediaTransferUiModel {
         progress = if (status == MediaTransferStatus.Completed) 1f else progress,
         isOutgoing = isOutgoing,
         status = status,
-        outputPath = outputPath
+        outputPath = outputPath,
+        createdAtEpochMillis = createdAtEpochMillis
     )
 }
 
@@ -311,7 +342,8 @@ private fun DirectMessage.toUiModel(): ChatMessageUiModel {
                 DirectMessageStatus.Failed ->
                     MessageDeliveryStatus.Failed
             }
-        }
+        },
+        createdAtEpochMillis = sentAtEpochMillis
     )
 }
 

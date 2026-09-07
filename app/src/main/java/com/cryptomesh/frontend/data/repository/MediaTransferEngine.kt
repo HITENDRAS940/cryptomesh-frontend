@@ -13,7 +13,8 @@ import java.util.UUID
 data class PreparedMediaTransfer(
     val offer: MediaOfferPayload,
     val transferKey: ByteArray,
-    val chunks: List<PreparedMediaChunk>
+    val chunks: List<PreparedMediaChunk>,
+    val previewBytes: ByteArray
 )
 
 data class PreparedMediaChunk(
@@ -45,18 +46,22 @@ class MediaTransferEngine(
             "Media chunk size must be between $MIN_MEDIA_CHUNK_BYTES and " +
                 "$MAX_MEDIA_CHUNK_BYTES bytes."
         }
-        val cleanFileName = fileName.trim().take(MAX_FILE_NAME_LENGTH)
+        val cleanFileName = normalizeMediaFileName(fileName, mimeType, mediaKind).trim().take(MAX_FILE_NAME_LENGTH)
         require(cleanFileName.isNotEmpty()) { "Media file name is required." }
         require(mimeType.startsWith("image/") ||
             mimeType.startsWith("video/") ||
-            mimeType.startsWith("audio/")
+            mimeType.startsWith("audio/") ||
+            mimeType.startsWith("application/pdf") ||
+            mimeType.endsWith("/pdf") ||
+            mimeType == "application/octet-stream" && fileName.endsWith(".pdf", ignoreCase = true)
         ) {
-            "Only photo, video, and audio media are supported."
+            "Only photo, video, audio, and PDF media are supported."
         }
 
+        val payloadBytes = optimizeTransferBytes(mediaKind, mimeType, bytes)
         val id = transferId()
         val createdAt = now()
-        val chunks = bytes
+        val chunks = payloadBytes
             .asIterableChunks(chunkSizeBytes)
             .mapIndexed { index, chunk ->
                 PreparedMediaChunk(
@@ -75,16 +80,17 @@ class MediaTransferEngine(
                 mediaKind = mediaKind,
                 fileName = cleanFileName,
                 mimeType = mimeType,
-                sizeBytes = bytes.size.toLong(),
+                sizeBytes = payloadBytes.size.toLong(),
                 chunkSizeBytes = chunkSizeBytes,
                 totalChunks = chunks.size,
-                fileSha256Base64 = sha256(bytes).toBase64(),
+                fileSha256Base64 = sha256(payloadBytes).toBase64(),
                 encryptedTransferKeyBase64 = transferKey.toBase64(),
                 createdAtEpochMillis = createdAt,
                 expiresAtEpochMillis = createdAt + ttlMillis
             ),
             transferKey = transferKey,
-            chunks = chunks
+            chunks = chunks,
+            previewBytes = payloadBytes
         )
     }
 
@@ -211,6 +217,68 @@ private fun ByteArray.asIterableChunks(chunkSizeBytes: Int): List<ByteArray> {
     return indices.step(chunkSizeBytes).map { start ->
         copyOfRange(start, minOf(start + chunkSizeBytes, size))
     }
+}
+
+private fun optimizeTransferBytes(
+    mediaKind: MediaKind,
+    mimeType: String,
+    bytes: ByteArray
+): ByteArray {
+    if (mediaKind != MediaKind.Photo || !mimeType.startsWith("image/") || !isAndroidRuntime()) {
+        return bytes
+    }
+    val options = android.graphics.BitmapFactory.Options().apply {
+        inJustDecodeBounds = true
+    }
+    android.graphics.BitmapFactory.decodeByteArray(bytes, 0, bytes.size, options)
+    val maxDimension = 1_600
+    var sampleSize = 1
+    if (options.outWidth > maxDimension || options.outHeight > maxDimension) {
+        val widthRatio = kotlin.math.ceil(options.outWidth.toDouble() / maxDimension.toDouble())
+        val heightRatio = kotlin.math.ceil(options.outHeight.toDouble() / maxDimension.toDouble())
+        sampleSize = maxOf(1, minOf(widthRatio.toInt(), heightRatio.toInt()))
+    }
+    val samplingOptions = android.graphics.BitmapFactory.Options().apply {
+        inSampleSize = sampleSize
+        inPreferredConfig = android.graphics.Bitmap.Config.ARGB_8888
+    }
+    val bitmap = android.graphics.BitmapFactory.decodeByteArray(bytes, 0, bytes.size, samplingOptions)
+        ?: return bytes
+    val stream = java.io.ByteArrayOutputStream()
+    val quality = 0.72f
+    bitmap.compress(android.graphics.Bitmap.CompressFormat.JPEG, (quality * 100).toInt(), stream)
+    bitmap.recycle()
+    return stream.toByteArray()
+}
+
+private fun isAndroidRuntime(): Boolean {
+    return runCatching {
+        android.os.Build.VERSION.SDK_INT > 0
+    }.getOrDefault(false)
+}
+
+private fun normalizeMediaFileName(
+    fileName: String,
+    mimeType: String,
+    mediaKind: MediaKind
+): String {
+    val trimmed = fileName.trim().ifBlank { "media" }
+    if (mediaKind == MediaKind.Photo && !trimmed.lowercase().endsWith(".jpg") &&
+        !trimmed.lowercase().endsWith(".jpeg") &&
+        !trimmed.lowercase().endsWith(".png") &&
+        !trimmed.lowercase().endsWith(".webp")
+    ) {
+        val suffix = when {
+            mimeType.startsWith("image/jpeg") -> ".jpg"
+            mimeType.startsWith("image/png") -> ".png"
+            else -> ".jpg"
+        }
+        return trimmed + suffix
+    }
+    if (mediaKind == MediaKind.Photo && trimmed.lowercase().endsWith(".png")) {
+        return trimmed.removeSuffix(".png") + ".jpg"
+    }
+    return trimmed
 }
 
 private fun chunkAssociatedData(

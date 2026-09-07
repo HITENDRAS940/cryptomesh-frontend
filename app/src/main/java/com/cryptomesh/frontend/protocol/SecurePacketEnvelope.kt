@@ -10,6 +10,7 @@ enum class SecurePacketType {
     MediaAccept,
     MediaReject,
     MediaChunk,
+    MediaFragment,
     MediaChunkAcknowledgement,
     MediaComplete
 }
