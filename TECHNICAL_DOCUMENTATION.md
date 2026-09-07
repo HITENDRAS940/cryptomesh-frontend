@@ -23,6 +23,27 @@ Local identity
 The beta intentionally excludes every simulated feature previously used for
 frontend demonstrations.
 
+## 1.1 Recent reliability and media-transfer improvements
+
+The latest update addressed the recurring offline/authentication bug and the
+media-transfer instability that was causing chat disruption:
+
+- stale authenticated sessions are cleaned up when a transport link drops,
+  preventing peers from staying falsely authenticated after offline transitions
+- media sends are detached from the synchronous chat action path and continue in
+  the background so text messages remain responsive
+- large payloads are split into BLE-friendly fragments, reassembled on receipt,
+  and only marked complete after successful chunk verification and acknowledgements
+- incomplete or interrupted transfers are marked as Failed rather than silently
+  deleted so the UI can display a failure state and preserve metadata for retry
+- image and video transfers are rendered as in-chat previews and can be opened
+  after successful delivery; PDFs can be selected and opened through system apps
+- large images are optimized before transfer to reduce packet volume and improve
+  delivery speed while preserving app-level integrity checks
+
+These changes keep the mesh session stable while allowing media to share the
+same conversation timeline without breaking subsequent messages.
+
 ## 2. Technology Stack
 
 | Area | Technology |
@@ -80,6 +101,13 @@ flowchart TD
 
 Compose screens do not call Android Bluetooth, Room, or cryptography APIs
 directly. Android-specific work is behind repository and transport interfaces.
+
+A recent design adjustment keeps media transfers in the same message timeline as
+conversation events instead of rendering them as a detached top-of-thread card.
+The `ChatViewModel` orders conversation messages and media transfer records by
+creation timestamp, and the `ChatScreen` timeline displays them as a single
+scrolling sequence. This preserves the natural chat flow even when a media file
+is being transferred or has just completed.
 
 ## 5. Application Startup
 

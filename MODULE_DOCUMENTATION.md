@@ -5,6 +5,16 @@ ownership, and future maintainability. It does not require a physical Gradle
 module split. The current app remains a single Android application module while
 these boundaries describe how the code should be understood and extended.
 
+## Recent reliability and media-transfer updates
+
+The most recent changes focused on three areas:
+
+- Session resilience: stale authenticated sessions are removed after transport disconnects so peers do not remain falsely authenticated while the link is offline.
+- Media transfer reliability: large media payloads are sent asynchronously in the background, fragments are reassembled before completion, and interrupted/incomplete transfers are marked as Failed instead of silently disappearing.
+- User-visible transfer flow: queueing, loading states, and in-chat media cards were improved so the user can preview images/video/PDF items in the correct conversational order without blocking text chat.
+
+For the UI layer, transfers are now treated as conversation timeline items rather than top-of-chat floating cards. This keeps normal messages above and below the media item in the correct order. For the repository layer, outgoing media transfer is decoupled from the immediate send action and continues through chunk fragmentation plus acknowledgement-driven completion.
+
 ## Module Map
 
 | Logical module | Primary files | Main responsibility |
@@ -111,8 +121,14 @@ Screen responsibilities:
 - `CreateIdentityScreen`: creates a local offline identity.
 - `DashboardScreen`: shows mesh status, peer count, and message activity.
 - `PeersScreen`: displays discovered peers and scan/advertise controls.
-- `ChatScreen`: displays offline messages and media transfer cards, and allows
-  sending text, photos, videos, and audio through BLE.
+- `ChatScreen`: displays offline messages and media transfer cards in timeline order, and allows sending text, photos, videos, audio, and PDF payloads through BLE.
+
+  Recent UI behavior:
+
+  - media cards show a loading/progress state while transmitting
+  - previews render for completed image/video/PDF assets in the same thread as normal messages
+  - messages before and after media are ordered chronologically rather than pinned to the top of the chat thread
+  - completed media can be opened from the app using the system viewer or compatible device apps
 - `PermissionsScreen`: explains and requests required local Android
   permissions.
 - `ProfileScreen`: displays local identity and reset controls.
