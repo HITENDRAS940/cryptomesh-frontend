@@ -228,7 +228,7 @@ class BleDirectMeshRepository(
 
     override fun disconnect(linkId: String) {
         pendingHandshakes.remove(linkId)
-        sessions.remove(linkId)
+        removeSessionForLink(linkId)
         transport.disconnect(linkId)
         updatePeer(linkId) {
             it.copy(
@@ -490,7 +490,7 @@ class BleDirectMeshRepository(
 
             TransportLinkStatus.Disconnected -> {
                 pendingHandshakes.remove(event.linkId)
-                sessions.remove(event.linkId)
+                removeSessionForLink(event.linkId)
                 updatePeer(event.linkId) {
                     it.copy(
                         status = DirectPeerStatus.Discovered,
@@ -505,7 +505,7 @@ class BleDirectMeshRepository(
 
             TransportLinkStatus.Failed -> {
                 pendingHandshakes.remove(event.linkId)
-                sessions.remove(event.linkId)
+                removeSessionForLink(event.linkId)
                 ensurePeer(event.linkId)
                 updatePeer(event.linkId) {
                     it.copy(
@@ -1025,10 +1025,19 @@ class BleDirectMeshRepository(
         }
     }
 
+    private fun removeSessionForLink(linkId: String) {
+        val removed = sessions.remove(linkId) ?: return
+        sessionsByDeviceId.compute(removed.peerDeviceId) { _, existing ->
+            existing?.filterNot { it !== removed }?.takeIf { it.isNotEmpty() }
+        }
+    }
+
     private fun currentSessionFor(
         peerDeviceId: String
     ): AuthenticatedSession? {
-        return sessionsByDeviceId[peerDeviceId]?.lastOrNull()
+        // Prefer an active session associated with a transport link.
+        val active = sessions.values.lastOrNull { it.peerDeviceId == peerDeviceId }
+        return active ?: sessionsByDeviceId[peerDeviceId]?.lastOrNull()
     }
 
     private fun openWithKnownPeerSession(
