@@ -31,6 +31,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 
 enum class DirectPeerStatus {
@@ -1029,6 +1030,37 @@ class BleDirectMeshRepository(
         val removed = sessions.remove(linkId) ?: return
         sessionsByDeviceId.compute(removed.peerDeviceId) { _, existing ->
             existing?.filterNot { it !== removed }?.takeIf { it.isNotEmpty() }
+        }
+
+        // Clean up any in-progress media transfers for the peer when the
+        // underlying transport link is removed. Run asynchronously.
+        applicationScope.launch {
+            try {
+                // Collect a snapshot of transfers and remove any transient ones.
+                val transient = setOf(
+                    MediaTransferStatus.Offered,
+                    MediaTransferStatus.Accepted,
+                    MediaTransferStatus.Queued,
+                    MediaTransferStatus.Transferring,
+                    MediaTransferStatus.Receiving,
+                    MediaTransferStatus.Verifying
+                )
+                val transfersSnapshot = mediaTransferRepository.transfers.first()
+                transfersSnapshot
+                    .filter { it.peerDeviceId == removed.peerDeviceId }
+                    .filter { it.status in transient }
+                    .forEach { transfer ->
+                        // remove DB entries and any stored files for this transfer
+                        mediaTransferRepository.deleteTransfer(transfer.transferId)
+                        try {
+                            mediaFileStore.deleteTransferFiles(transfer.transferId)
+                        } catch (_: Exception) {
+                            // Best-effort: ignore filesystem cleanup failures
+                        }
+                    }
+            } catch (_: Exception) {
+                // swallow errors to avoid crashing repository event handlers
+            }
         }
     }
 

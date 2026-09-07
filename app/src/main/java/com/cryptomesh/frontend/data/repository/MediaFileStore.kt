@@ -16,7 +16,11 @@ interface MediaFileStore {
         fileName: String,
         bytes: ByteArray
     ): String
+
+    /** Delete all files associated with a transfer (encrypted chunks and completed media). */
+    fun deleteTransferFiles(transferId: String)
 }
+
 
 class LocalMediaFileStore(
     rootDirectory: File
@@ -47,6 +51,13 @@ class LocalMediaFileStore(
         val file = File(directory, safeSegment(fileName))
         file.writeBytes(bytes)
         return file.absolutePath
+    }
+
+    override fun deleteTransferFiles(transferId: String) {
+        val directory = File(root, safeSegment(transferId))
+        if (directory.exists()) {
+            directory.deleteRecursively()
+        }
     }
 }
 
