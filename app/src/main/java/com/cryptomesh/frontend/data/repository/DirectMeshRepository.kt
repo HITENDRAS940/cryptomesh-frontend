@@ -1050,12 +1050,28 @@ class BleDirectMeshRepository(
                     .filter { it.peerDeviceId == removed.peerDeviceId }
                     .filter { it.status in transient }
                     .forEach { transfer ->
-                        // remove DB entries and any stored files for this transfer
-                        mediaTransferRepository.deleteTransfer(transfer.transferId)
+                        // Mark transfer as failed so UI shows a failed card instead
+                        // of silently removing the transfer and its files. Also mark
+                        // any associated chunks as Failed for clarity.
                         try {
-                            mediaFileStore.deleteTransferFiles(transfer.transferId)
+                            mediaTransferRepository.updateTransferStatus(
+                                transfer.transferId,
+                                MediaTransferStatus.Failed
+                            )
                         } catch (_: Exception) {
-                            // Best-effort: ignore filesystem cleanup failures
+                            // Best-effort: ignore DB failures here
+                        }
+
+                        transfer.chunks.forEach { chunk ->
+                            try {
+                                mediaTransferRepository.updateChunkStatus(
+                                    transfer.transferId,
+                                    chunk.chunkIndex,
+                                    MediaChunkStatus.Failed
+                                )
+                            } catch (_: Exception) {
+                                // Best-effort: ignore per-chunk failures
+                            }
                         }
                     }
             } catch (_: Exception) {
