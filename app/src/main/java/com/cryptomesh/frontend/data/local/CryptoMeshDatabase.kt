@@ -12,9 +12,10 @@ import androidx.sqlite.db.SupportSQLiteDatabase
         LocalIdentityEntity::class,
         SecurePacketEntity::class,
         MediaTransferEntity::class,
-        MediaChunkEntity::class
+        MediaChunkEntity::class,
+        GroupEntity::class
     ],
-    version = 2,
+    version = 3,
     exportSchema = true
 )
 abstract class CryptoMeshDatabase : RoomDatabase() {
@@ -25,6 +26,8 @@ abstract class CryptoMeshDatabase : RoomDatabase() {
     abstract fun mediaTransferDao(): MediaTransferDao
 
     abstract fun mediaChunkDao(): MediaChunkDao
+
+    abstract fun groupDao(): GroupDao
 
     companion object {
         @Volatile
@@ -37,7 +40,7 @@ abstract class CryptoMeshDatabase : RoomDatabase() {
                     CryptoMeshDatabase::class.java,
                     "cryptomesh.db"
                 )
-                    .addMigrations(MIGRATION_1_2)
+                    .addMigrations(MIGRATION_1_2, MIGRATION_2_3)
                     .build()
                     .also { instance = it }
             }
@@ -115,6 +118,33 @@ abstract class CryptoMeshDatabase : RoomDatabase() {
                 db.execSQL(
                     "CREATE INDEX IF NOT EXISTS index_media_chunks_packetId " +
                         "ON media_chunks(packetId)"
+                )
+            }
+        }
+
+        private val MIGRATION_2_3 = object : Migration(2, 3) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL(
+                    """
+                    CREATE TABLE IF NOT EXISTS mesh_groups (
+                        groupId TEXT NOT NULL PRIMARY KEY,
+                        groupName TEXT NOT NULL,
+                        isBroadcastChannel INTEGER NOT NULL,
+                        creatorDeviceId TEXT NOT NULL,
+                        groupKeyBase64 TEXT NOT NULL,
+                        membersCsv TEXT NOT NULL,
+                        createdAtEpochMillis INTEGER NOT NULL,
+                        lastActivityEpochMillis INTEGER NOT NULL
+                    )
+                    """.trimIndent()
+                )
+                db.execSQL(
+                    "CREATE INDEX IF NOT EXISTS index_mesh_groups_isBroadcastChannel " +
+                        "ON mesh_groups(isBroadcastChannel)"
+                )
+                db.execSQL(
+                    "CREATE INDEX IF NOT EXISTS index_mesh_groups_createdAtEpochMillis " +
+                        "ON mesh_groups(createdAtEpochMillis)"
                 )
             }
         }

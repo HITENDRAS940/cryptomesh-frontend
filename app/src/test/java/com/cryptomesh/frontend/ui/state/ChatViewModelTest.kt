@@ -15,6 +15,7 @@ import kotlinx.coroutines.test.setMain
 import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Before
@@ -172,6 +173,96 @@ class ChatViewModelTest {
 
         assertTrue(repository.sentMessages.isEmpty())
         assertFalse(viewModel.uiState.value.errorMessage.isNullOrBlank())
+    }
+
+    @Test
+    fun groupConversationRendersAndSendsGroupText() = runTest {
+        val group = com.cryptomesh.frontend.data.repository.DirectGroup(
+            groupId = "GRP-TEST1",
+            groupName = "Alpha Squad",
+            isBroadcastChannel = false,
+            creatorDeviceId = "CM-ME",
+            members = listOf("CM-ME", "CM-PEER1"),
+            createdAtEpochMillis = 1000L,
+            lastActivityEpochMillis = 1000L
+        )
+        val repository = FakeDirectMeshRepository(
+            DirectMeshState(groups = listOf(group))
+        )
+        val viewModel = ChatViewModel(repository)
+        advanceUntilIdle()
+
+        val conv = viewModel.uiState.value.conversations.single()
+        assertEquals("group-GRP-TEST1", conv.id)
+        assertEquals("Alpha Squad", conv.peerName)
+        assertTrue(conv.isGroup)
+        assertFalse(conv.isBroadcastChannel)
+        assertEquals(2, conv.memberCount)
+
+        viewModel.openConversation(conv.id)
+        viewModel.updateComposer("Hold position")
+        viewModel.sendMessage()
+        advanceUntilIdle()
+
+        assertEquals(listOf("GRP-TEST1" to "Hold position"), repository.sentGroupMessages)
+        assertEquals("", viewModel.uiState.value.composerText)
+    }
+
+    @Test
+    fun broadcastConversationRendersAndSendsBroadcastText() = runTest {
+        val channel = com.cryptomesh.frontend.data.repository.DirectGroup(
+            groupId = "CHANNEL-GENERAL",
+            groupName = "#general",
+            isBroadcastChannel = true,
+            creatorDeviceId = "SYSTEM",
+            members = emptyList(),
+            createdAtEpochMillis = 1000L,
+            lastActivityEpochMillis = 1000L
+        )
+        val repository = FakeDirectMeshRepository(
+            DirectMeshState(groups = listOf(channel))
+        )
+        val viewModel = ChatViewModel(repository)
+        advanceUntilIdle()
+
+        val conv = viewModel.uiState.value.conversations.single()
+        assertEquals("group-CHANNEL-GENERAL", conv.id)
+        assertTrue(conv.isBroadcastChannel)
+
+        viewModel.openConversation(conv.id)
+        viewModel.updateComposer("Mesh broadcast beacon active")
+        viewModel.sendMessage()
+        advanceUntilIdle()
+
+        assertEquals(
+            listOf("CHANNEL-GENERAL" to "Mesh broadcast beacon active"),
+            repository.sentBroadcastMessages
+        )
+    }
+
+    @Test
+    fun createGroupDialogOpensAndCreatesGroup() = runTest {
+        val peer = connectedPeer()
+        val repository = FakeDirectMeshRepository(
+            DirectMeshState(peers = listOf(peer))
+        )
+        val viewModel = ChatViewModel(repository)
+        advanceUntilIdle()
+
+        viewModel.openCreateGroupDialog()
+        assertTrue(viewModel.uiState.value.isCreateGroupDialogOpen)
+        assertEquals(1, viewModel.uiState.value.availablePeersForGroup.size)
+        assertEquals("CM-12345678", viewModel.uiState.value.availablePeersForGroup.first().deviceId)
+
+        viewModel.createGroup("Delta Force", listOf("CM-12345678"))
+        advanceUntilIdle()
+
+        assertFalse(viewModel.uiState.value.isCreateGroupDialogOpen)
+        assertEquals(
+            listOf("Delta Force" to listOf("CM-12345678")),
+            repository.createdGroups
+        )
+        assertNotNull(viewModel.uiState.value.groupCreationSuccessMessage)
     }
 
     private fun connectedPeer(): DirectPeer {

@@ -424,7 +424,7 @@ class BleDirectMeshRepositoryTest {
     }
 }
 
-private class FixedIdentityRepository(
+internal class FixedIdentityRepository(
     identity: LocalIdentity
 ) : IdentityRepository {
     private val current = MutableStateFlow<LocalIdentity?>(identity)
@@ -439,7 +439,7 @@ private class FixedIdentityRepository(
     }
 }
 
-private class MemoryPacketRepository : SecurePacketRepository {
+internal class MemoryPacketRepository : SecurePacketRepository {
     private val stored = linkedMapOf<String, StoredSecurePacket>()
     private val current = MutableStateFlow<List<StoredSecurePacket>>(emptyList())
     override val packets: Flow<List<StoredSecurePacket>> = current
@@ -492,7 +492,7 @@ private class MemoryPacketRepository : SecurePacketRepository {
     }
 }
 
-private class MemoryMediaTransferRepository : MediaTransferRepository {
+internal class MemoryMediaTransferRepository : MediaTransferRepository {
     private val storedTransfers = linkedMapOf<String, StoredMediaTransfer>()
     private val storedChunks = linkedMapOf<Pair<String, Int>, StoredMediaChunk>()
     private val current = MutableStateFlow<List<StoredMediaTransfer>>(emptyList())
@@ -593,7 +593,7 @@ private class MemoryMediaTransferRepository : MediaTransferRepository {
     }
 }
 
-private class TestMeshNetwork {
+internal class TestMeshNetwork {
     private val transports = mutableMapOf<String, MeshNearbyTransport>()
 
     @Synchronized
@@ -629,7 +629,7 @@ private class TestMeshNetwork {
     }
 }
 
-private class MeshNearbyTransport(
+internal class MeshNearbyTransport(
     val transportId: String,
     private val network: TestMeshNetwork
 ) : NearbyTransport {
@@ -730,7 +730,7 @@ private class MeshNearbyTransport(
     }
 }
 
-private class PairedNearbyTransport(
+internal class PairedNearbyTransport(
     val transportId: String
 ) : NearbyTransport {
     private val _events = MutableSharedFlow<NearbyTransportEvent>(
@@ -813,7 +813,7 @@ private class PairedNearbyTransport(
     override fun close() = Unit
 }
 
-private class TestSignatureService : PacketSignatureService {
+internal class TestSignatureService : PacketSignatureService {
     private val keyPair = KeyPairGenerator.getInstance("EC").run {
         initialize(ECGenParameterSpec("secp256r1"))
         generateKeyPair()
@@ -848,7 +848,7 @@ private class TestSignatureService : PacketSignatureService {
     }
 }
 
-private class IncrementingClock {
+internal class IncrementingClock {
     private var value = 10_000L
 
     @Synchronized

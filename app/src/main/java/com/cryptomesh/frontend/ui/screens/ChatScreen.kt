@@ -43,10 +43,13 @@ import androidx.compose.material.icons.automirrored.filled.Chat
 import androidx.compose.material.icons.automirrored.filled.Send
 import androidx.compose.material.icons.filled.AttachFile
 import androidx.compose.material.icons.filled.AudioFile
+import androidx.compose.material.icons.filled.Campaign
 import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.Description
 import androidx.compose.material.icons.filled.DoneAll
 import androidx.compose.material.icons.filled.ErrorOutline
+import androidx.compose.material.icons.filled.Group
+import androidx.compose.material.icons.filled.GroupAdd
 import androidx.compose.material.icons.filled.Image
 import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.PauseCircle
@@ -54,8 +57,11 @@ import androidx.compose.material.icons.filled.PictureAsPdf
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Schedule
 import androidx.compose.material.icons.filled.VideoFile
+import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.Checkbox
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -72,6 +78,7 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
@@ -102,6 +109,7 @@ import com.cryptomesh.frontend.ui.state.ConversationUiModel
 import com.cryptomesh.frontend.ui.state.MediaAttachmentUiModel
 import com.cryptomesh.frontend.ui.state.MediaTransferUiModel
 import com.cryptomesh.frontend.ui.state.MessageDeliveryStatus
+import com.cryptomesh.frontend.ui.state.PeerOption
 import java.io.File
 import java.util.Locale
 
@@ -137,6 +145,21 @@ fun ChatScreen(viewModel: ChatViewModel) {
         snackbarHostState.showSnackbar(message)
         viewModel.dismissError()
     }
+    LaunchedEffect(uiState.groupCreationSuccessMessage) {
+        val message = uiState.groupCreationSuccessMessage ?: return@LaunchedEffect
+        snackbarHostState.showSnackbar(message)
+        viewModel.clearGroupSuccessMessage()
+    }
+
+    if (uiState.isCreateGroupDialogOpen) {
+        CreateGroupDialog(
+            availablePeers = uiState.availablePeersForGroup,
+            onDismiss = viewModel::closeCreateGroupDialog,
+            onCreate = { name, memberIds ->
+                viewModel.createGroup(name, memberIds)
+            }
+        )
+    }
 
     Scaffold(
         contentWindowInsets = WindowInsets(0, 0, 0, 0),
@@ -146,6 +169,7 @@ fun ChatScreen(viewModel: ChatViewModel) {
             ConversationInbox(
                 conversations = uiState.conversations,
                 onOpenConversation = viewModel::openConversation,
+                onCreateGroupClick = viewModel::openCreateGroupDialog,
                 modifier = Modifier.padding(padding)
             )
         } else {
@@ -176,9 +200,136 @@ fun ChatScreen(viewModel: ChatViewModel) {
 }
 
 @Composable
+private fun CreateGroupDialog(
+    availablePeers: List<PeerOption>,
+    onDismiss: () -> Unit,
+    onCreate: (String, List<String>) -> Unit
+) {
+    var groupName by remember { mutableStateOf("") }
+    val selectedPeerIds = remember { mutableStateListOf<String>() }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = {
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                Icon(
+                    Icons.Default.GroupAdd,
+                    contentDescription = null,
+                    tint = MaterialTheme.colorScheme.primary
+                )
+                Text("Create Encrypted Group")
+            }
+        },
+        text = {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(vertical = 4.dp),
+                verticalArrangement = Arrangement.spacedBy(12.dp)
+            ) {
+                OutlinedTextField(
+                    value = groupName,
+                    onValueChange = { groupName = it },
+                    label = { Text("Group Name") },
+                    placeholder = { Text("e.g. Alpha Squad") },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth()
+                )
+
+                Text(
+                    text = "Invite Verified Peers",
+                    style = MaterialTheme.typography.titleSmall,
+                    fontWeight = FontWeight.SemiBold
+                )
+
+                if (availablePeers.isEmpty()) {
+                    Text(
+                        text = "No authenticated peers currently online. You can still create the group now and invite peers when they connect.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                } else {
+                    LazyColumn(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .heightIn(max = 180.dp),
+                        verticalArrangement = Arrangement.spacedBy(4.dp)
+                    ) {
+                        items(availablePeers, key = { it.deviceId }) { peer ->
+                            val isSelected = selectedPeerIds.contains(peer.deviceId)
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .clip(RoundedCornerShape(8.dp))
+                                    .clickable {
+                                        if (isSelected) {
+                                            selectedPeerIds.remove(peer.deviceId)
+                                        } else {
+                                            selectedPeerIds.add(peer.deviceId)
+                                        }
+                                    }
+                                    .padding(vertical = 4.dp, horizontal = 6.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(8.dp)
+                            ) {
+                                Checkbox(
+                                    checked = isSelected,
+                                    onCheckedChange = { checked ->
+                                        if (checked) {
+                                            selectedPeerIds.add(peer.deviceId)
+                                        } else {
+                                            selectedPeerIds.remove(peer.deviceId)
+                                        }
+                                    }
+                                )
+                                Column(modifier = Modifier.weight(1f)) {
+                                    Text(
+                                        text = peer.displayName,
+                                        style = MaterialTheme.typography.bodyMedium,
+                                        fontWeight = FontWeight.Medium
+                                    )
+                                    Text(
+                                        text = peer.deviceId,
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
+
+                Text(
+                    text = "A shared 256-bit AES group key will be generated and distributed securely via 1-to-1 ECDH sessions.",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+        },
+        confirmButton = {
+            Button(
+                onClick = { onCreate(groupName, selectedPeerIds.toList()) },
+                enabled = groupName.isNotBlank()
+            ) {
+                Text("Create")
+            }
+        },
+        dismissButton = {
+            OutlinedButton(onClick = onDismiss) {
+                Text("Cancel")
+            }
+        }
+    )
+}
+
+@Composable
 private fun ConversationInbox(
     conversations: List<ConversationUiModel>,
     onOpenConversation: (String) -> Unit,
+    onCreateGroupClick: () -> Unit,
     modifier: Modifier = Modifier
 ) {
     Surface(
@@ -188,13 +339,15 @@ private fun ConversationInbox(
         Column(modifier = Modifier.fillMaxSize()) {
             MainTabHeader(
                 title = "Secure Chat",
-                supportingText = "${conversations.size} authenticated conversations",
+                supportingText = "${conversations.size} channels & conversations",
                 trailingContent = {
-                    Icon(
-                        Icons.Default.Lock,
-                        contentDescription = null,
-                        tint = MaterialTheme.colorScheme.primary
-                    )
+                    IconButton(onClick = onCreateGroupClick) {
+                        Icon(
+                            Icons.Default.GroupAdd,
+                            contentDescription = "New Group",
+                            tint = MaterialTheme.colorScheme.primary
+                        )
+                    }
                 }
             )
             if (conversations.isEmpty()) {
@@ -208,7 +361,7 @@ private fun ConversationInbox(
                         icon = Icons.AutoMirrored.Filled.Chat,
                         title = "No conversations",
                         description =
-                            "Authenticated peer sessions appear here."
+                            "Authenticated peer sessions and mesh channels appear here."
                     )
                 }
             } else {
@@ -255,16 +408,32 @@ private fun ConversationCard(
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.spacedBy(12.dp)
         ) {
+            val icon = when {
+                conversation.isBroadcastChannel -> Icons.Default.Campaign
+                conversation.isGroup -> Icons.Default.Group
+                else -> Icons.Default.Lock
+            }
+            val iconContainerColor = when {
+                conversation.isBroadcastChannel -> MaterialTheme.colorScheme.secondaryContainer
+                conversation.isGroup -> MaterialTheme.colorScheme.tertiaryContainer
+                else -> MaterialTheme.colorScheme.primaryContainer
+            }
+            val iconTint = when {
+                conversation.isBroadcastChannel -> MaterialTheme.colorScheme.onSecondaryContainer
+                conversation.isGroup -> MaterialTheme.colorScheme.onTertiaryContainer
+                else -> MaterialTheme.colorScheme.onPrimaryContainer
+            }
+
             Surface(
                 modifier = Modifier.size(44.dp),
                 shape = CircleShape,
-                color = MaterialTheme.colorScheme.primaryContainer
+                color = iconContainerColor
             ) {
                 Box(contentAlignment = Alignment.Center) {
                     Icon(
-                        Icons.Default.Lock,
+                        imageVector = icon,
                         contentDescription = null,
-                        tint = MaterialTheme.colorScheme.onPrimaryContainer
+                        tint = iconTint
                     )
                 }
             }
@@ -274,7 +443,11 @@ private fun ConversationCard(
                     verticalAlignment = Alignment.CenterVertically
                 ) {
                     Text(
-                        conversation.peerName,
+                        text = if (conversation.isBroadcastChannel && !conversation.peerName.startsWith("#")) {
+                            "#${conversation.peerName}"
+                        } else {
+                            conversation.peerName
+                        },
                         modifier = Modifier.weight(1f),
                         style = MaterialTheme.typography.titleMedium,
                         fontWeight = FontWeight.SemiBold,
@@ -287,16 +460,53 @@ private fun ConversationCard(
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
                 }
-                Text(
-                    conversation.preview,
-                    style = MaterialTheme.typography.bodyMedium,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis
-                )
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    if (conversation.isBroadcastChannel) {
+                        Surface(
+                            shape = RoundedCornerShape(4.dp),
+                            color = MaterialTheme.colorScheme.secondaryContainer
+                        ) {
+                            Text(
+                                "Broadcast",
+                                modifier = Modifier.padding(horizontal = 4.dp, vertical = 1.dp),
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.onSecondaryContainer
+                            )
+                        }
+                    } else if (conversation.isGroup) {
+                        Surface(
+                            shape = RoundedCornerShape(4.dp),
+                            color = MaterialTheme.colorScheme.tertiaryContainer
+                        ) {
+                            Text(
+                                "${conversation.memberCount} members",
+                                modifier = Modifier.padding(horizontal = 4.dp, vertical = 1.dp),
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.onTertiaryContainer
+                            )
+                        }
+                    }
+                    Text(
+                        conversation.preview,
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.weight(1f)
+                    )
+                }
             }
             StatusPill(
-                text = if (conversation.isConnected) "Live" else "Offline"
+                text = when {
+                    conversation.isBroadcastChannel -> "Public"
+                    conversation.isGroup -> "Mesh"
+                    conversation.isConnected -> "Live"
+                    else -> "Offline"
+                }
             )
         }
     }
@@ -361,23 +571,38 @@ private fun ConversationThread(
         Column(
             modifier = Modifier.fillMaxSize()
         ) {
+            val title = if (conversation.isBroadcastChannel && !conversation.peerName.startsWith("#")) {
+                "#${conversation.peerName}"
+            } else {
+                conversation.peerName
+            }
+            val supportingText = when {
+                conversation.isBroadcastChannel -> "Public mesh broadcast channel"
+                conversation.isGroup -> "Encrypted mesh group • ${conversation.memberCount} members"
+                conversation.isConnected -> "Verified encrypted session"
+                else -> "Verified offline queue"
+            }
+            val headerIcon = when {
+                conversation.isBroadcastChannel -> Icons.Default.Campaign
+                conversation.isGroup -> Icons.Default.Group
+                else -> Icons.Default.Lock
+            }
+            val headerIconTint = when {
+                conversation.isBroadcastChannel -> MaterialTheme.colorScheme.secondary
+                conversation.isGroup -> MaterialTheme.colorScheme.tertiary
+                conversation.isConnected -> MaterialTheme.colorScheme.primary
+                else -> MaterialTheme.colorScheme.onSurfaceVariant
+            }
+
             ScreenHeader(
-                title = conversation.peerName,
-                supportingText = if (conversation.isConnected) {
-                    "Verified encrypted session"
-                } else {
-                    "Verified offline queue"
-                },
+                title = title,
+                supportingText = supportingText,
                 onBack = onBack,
                 trailingContent = {
                     Icon(
-                        Icons.Default.Lock,
-                        contentDescription = "Encrypted session",
-                        tint = if (conversation.isConnected) {
-                            MaterialTheme.colorScheme.primary
-                        } else {
-                            MaterialTheme.colorScheme.onSurfaceVariant
-                        }
+                        headerIcon,
+                        contentDescription = "Session status",
+                        tint = headerIconTint
                     )
                 }
             )
@@ -389,8 +614,12 @@ private fun ConversationThread(
                     contentAlignment = Alignment.Center
                 ) {
                     EmptyState(
-                        icon = Icons.Default.Lock,
-                        title = "Encrypted session ready",
+                        icon = headerIcon,
+                        title = when {
+                            conversation.isBroadcastChannel -> "Broadcast Channel Active"
+                            conversation.isGroup -> "Group Chat Active"
+                            else -> "Encrypted session ready"
+                        },
                         description = conversation.deviceId
                     )
                 }
@@ -432,6 +661,7 @@ private fun ConversationThread(
                 text = composerText,
                 selectedAttachment = selectedAttachment,
                 enabled = conversation.isVerifiedSession,
+                mediaEnabled = !conversation.isBroadcastChannel,
                 onTextChange = onComposerChange,
                 onAttach = onAttach,
                 onClearAttachment = onClearAttachment,
@@ -469,14 +699,26 @@ private fun AnimatedMessageBubble(
                 },
                 shape = MaterialTheme.shapes.medium
             ) {
-                Text(
-                    message.text,
+                Column(
                     modifier = Modifier.padding(
                         horizontal = 14.dp,
                         vertical = 10.dp
-                    ),
-                    style = MaterialTheme.typography.bodyLarge
-                )
+                    )
+                ) {
+                    if (!message.isOutgoing && !message.senderDisplayName.isNullOrEmpty()) {
+                        Text(
+                            text = message.senderDisplayName,
+                            style = MaterialTheme.typography.labelMedium,
+                            fontWeight = FontWeight.Bold,
+                            color = MaterialTheme.colorScheme.primary,
+                            modifier = Modifier.padding(bottom = 2.dp)
+                        )
+                    }
+                    Text(
+                        message.text,
+                        style = MaterialTheme.typography.bodyLarge
+                    )
+                }
             }
             Row(
                 modifier = Modifier.padding(top = 3.dp),
@@ -537,6 +779,7 @@ private fun MessageComposer(
     text: String,
     selectedAttachment: MediaAttachmentUiModel?,
     enabled: Boolean,
+    mediaEnabled: Boolean = true,
     onTextChange: (String) -> Unit,
     onAttach: () -> Unit,
     onClearAttachment: () -> Unit,
@@ -567,7 +810,7 @@ private fun MessageComposer(
             ) {
                 IconButton(
                     onClick = onAttach,
-                    enabled = enabled
+                    enabled = enabled && mediaEnabled
                 ) {
                     Icon(
                         Icons.Default.AttachFile,

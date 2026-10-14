@@ -1,6 +1,7 @@
 package com.cryptomesh.frontend.transport
 
 import android.Manifest
+import com.cryptomesh.frontend.logging.MeshLog
 import android.annotation.SuppressLint
 import android.bluetooth.BluetoothDevice
 import android.bluetooth.BluetoothGatt
@@ -65,6 +66,7 @@ class AndroidBleTransport(
     override fun start(localNode: LocalTransportNode) {
         val isSameNode = this.localNode == localNode
         this.localNode = localNode
+        MeshLog.ble("Starting BLE transport with local deviceId=${localNode.deviceId}")
         if (!checkReady()) return
         if (isSameNode && gattServer != null && isAdvertising) {
             emitAvailability()
@@ -109,6 +111,7 @@ class AndroidBleTransport(
             return
         }
         runCatching {
+            MeshLog.ble("Starting BLE scan for service UUID $SERVICE_UUID...")
             scanner.startScan(
                 listOf(
                     ScanFilter.Builder()
@@ -123,6 +126,7 @@ class AndroidBleTransport(
             isScanning = true
             emit(NearbyTransportEvent.ScanChanged(scanning = true))
         }.onFailure {
+            MeshLog.error("BLE", "Unable to start BLE scan: ${it.message}")
             emit(
                 NearbyTransportEvent.ScanChanged(
                     scanning = false,
@@ -137,6 +141,7 @@ class AndroidBleTransport(
             emit(NearbyTransportEvent.ScanChanged(scanning = false))
             return
         }
+        MeshLog.ble("Stopping BLE scan.")
         runCatching {
             adapter?.bluetoothLeScanner?.stopScan(scanCallback)
         }
@@ -150,6 +155,7 @@ class AndroidBleTransport(
             discoveredDevices[linkId]
         }
         if (device == null) {
+            MeshLog.warn("BLE", "Cannot connect to $linkId: device not found in discovered list.")
             emit(
                 NearbyTransportEvent.LinkChanged(
                     linkId = linkId,
@@ -159,6 +165,7 @@ class AndroidBleTransport(
             )
             return
         }
+        MeshLog.ble("Initiating GATT client connection to $linkId...")
         emit(
             NearbyTransportEvent.LinkChanged(
                 linkId,
@@ -181,11 +188,13 @@ class AndroidBleTransport(
                 clientChannels[linkId] = ClientChannel(gatt = gatt)
             }
         }.onFailure {
+            MeshLog.error("BLE", "BLE connectGatt failed for $linkId: ${it.message}", it)
             emitLinkFailure(linkId, it.transportMessage("BLE connection failed"))
         }
     }
 
     override fun disconnect(linkId: String) {
+        MeshLog.ble("Disconnecting GATT link $linkId...")
         val client = synchronized(clientChannels) {
             clientChannels.remove(linkId)
         }
@@ -213,6 +222,7 @@ class AndroidBleTransport(
     override fun send(linkId: String, payload: ByteArray): Result<Unit> {
         return runCatching {
             val frames = frameCodec.chunk(payload)
+            MeshLog.transfer("BLE transport send: linkId=$linkId, payloadSize=${payload.size} bytes chunked into ${frames.size} frames")
             val client = synchronized(clientChannels) {
                 clientChannels[linkId]
             }
@@ -387,6 +397,7 @@ class AndroidBleTransport(
         val node = localNode ?: return
         val advertiser = adapter?.bluetoothLeAdvertiser
         if (advertiser == null) {
+            MeshLog.warn("BLE", "BLE advertising is unavailable: advertiser is null.")
             emit(
                 NearbyTransportEvent.Availability(
                     available = false,
@@ -399,6 +410,7 @@ class AndroidBleTransport(
             return
         }
         runCatching {
+            MeshLog.ble("Starting BLE advertising with deviceId=${node.deviceId}...")
             isAdvertisingStarting = true
             advertiser.startAdvertising(
                 AdvertiseSettings.Builder()
@@ -424,6 +436,7 @@ class AndroidBleTransport(
                 advertiseCallback
             )
         }.onFailure {
+            MeshLog.error("BLE", "Unable to start BLE advertising: ${it.message}", it)
             isAdvertisingStarting = false
             emit(
                 NearbyTransportEvent.Availability(
@@ -441,12 +454,14 @@ class AndroidBleTransport(
 
     private val advertiseCallback = object : AdvertiseCallback() {
         override fun onStartSuccess(settingsInEffect: AdvertiseSettings?) {
+            MeshLog.ble("BLE advertising started successfully!")
             isAdvertisingStarting = false
             isAdvertising = true
             emitAvailability()
         }
 
         override fun onStartFailure(errorCode: Int) {
+            MeshLog.error("BLE", "BLE advertising failed with errorCode=$errorCode")
             isAdvertisingStarting = false
             isAdvertising = false
             emit(
@@ -469,6 +484,7 @@ class AndroidBleTransport(
         }
 
         override fun onScanFailed(errorCode: Int) {
+            MeshLog.error("BLE", "BLE scan failed with errorCode=$errorCode")
             isScanning = false
             emit(
                 NearbyTransportEvent.ScanChanged(
@@ -486,6 +502,7 @@ class AndroidBleTransport(
             ?.decodeToString()
             ?.takeIf { it.startsWith("CM-") }
         if (advertisedDeviceId == localNode?.deviceId) return
+        MeshLog.ble("BLE scan discovered device address=$linkId, advertisedDeviceId=$advertisedDeviceId, rssi=${result.rssi}dBm")
         synchronized(discoveredDevices) {
             discoveredDevices[linkId] = result.device
         }
@@ -507,8 +524,10 @@ class AndroidBleTransport(
                 status: Int,
                 newState: Int
             ) {
+                MeshLog.ble("GATT client connectionStateChange: linkId=$linkId, status=$status, newState=$newState (Connected=${newState == BluetoothProfile.STATE_CONNECTED})")
                 when {
                     status != BluetoothGatt.GATT_SUCCESS -> {
+                        MeshLog.warn("BLE", "GATT client connection error: linkId=$linkId, status=$status")
                         closeClient(linkId)
                         emitLinkFailure(
                             linkId,
@@ -517,10 +536,12 @@ class AndroidBleTransport(
                     }
 
                     newState == BluetoothProfile.STATE_CONNECTED -> {
+                        MeshLog.ble("GATT client connected to $linkId, discovering services...")
                         gatt.requestConnectionPriority(
                             BluetoothGatt.CONNECTION_PRIORITY_HIGH
                         )
                         if (!gatt.discoverServices()) {
+                            MeshLog.error("BLE", "Failed to start service discovery on $linkId")
                             closeClient(linkId)
                             emitLinkFailure(
                                 linkId,
@@ -530,6 +551,7 @@ class AndroidBleTransport(
                     }
 
                     newState == BluetoothProfile.STATE_DISCONNECTED -> {
+                        MeshLog.ble("GATT client disconnected from $linkId")
                         closeClient(linkId)
                         clearLink(linkId)
                         emit(
@@ -546,6 +568,7 @@ class AndroidBleTransport(
                 gatt: BluetoothGatt,
                 status: Int
             ) {
+                MeshLog.ble("GATT services discovered for linkId=$linkId, status=$status")
                 if (status != BluetoothGatt.GATT_SUCCESS) {
                     emitLinkFailure(linkId, "BLE service discovery failed.")
                     return
@@ -553,6 +576,7 @@ class AndroidBleTransport(
                 val characteristic = gatt.getService(SERVICE_UUID)
                     ?.getCharacteristic(CHARACTERISTIC_UUID)
                 if (characteristic == null) {
+                    MeshLog.error("BLE", "Peer $linkId does not expose characteristic $CHARACTERISTIC_UUID")
                     emitLinkFailure(
                         linkId,
                         "Peer does not expose the CryptoMesh BLE service."
@@ -562,6 +586,7 @@ class AndroidBleTransport(
                 synchronized(clientChannels) {
                     clientChannels[linkId]?.characteristic = characteristic
                 }
+                MeshLog.ble("Requesting MTU $REQUESTED_MTU for linkId=$linkId...")
                 if (!gatt.requestMtu(REQUESTED_MTU)) {
                     enableClientNotifications(linkId)
                 }
@@ -572,6 +597,7 @@ class AndroidBleTransport(
                 mtu: Int,
                 status: Int
             ) {
+                MeshLog.ble("GATT MTU negotiated for linkId=$linkId: mtu=$mtu, status=$status")
                 enableClientNotifications(linkId)
             }
 
@@ -580,6 +606,7 @@ class AndroidBleTransport(
                 descriptor: BluetoothGattDescriptor,
                 status: Int
             ) {
+                MeshLog.ble("GATT descriptor written for linkId=$linkId, status=$status")
                 if (
                     descriptor.uuid != CLIENT_CONFIGURATION_UUID ||
                     status != BluetoothGatt.GATT_SUCCESS
@@ -593,6 +620,7 @@ class AndroidBleTransport(
                 synchronized(clientChannels) {
                     clientChannels[linkId]?.ready = true
                 }
+                MeshLog.ble("GATT client linkId=$linkId channel is READY for encrypted communication!")
                 emit(
                     NearbyTransportEvent.LinkChanged(
                         linkId,
@@ -610,6 +638,7 @@ class AndroidBleTransport(
                     clientChannels[linkId]?.writing = false
                 }
                 if (status != BluetoothGatt.GATT_SUCCESS) {
+                    MeshLog.warn("TRANSFER", "Encrypted BLE frame write failed on linkId=$linkId: status=$status")
                     emitLinkFailure(
                         linkId,
                         "Encrypted BLE frame write failed."
@@ -652,9 +681,9 @@ class AndroidBleTransport(
             return
         }
         if (!channel.gatt.setCharacteristicNotification(
-                characteristic,
-                true
-            )
+            characteristic,
+            true
+        )
         ) {
             emitLinkFailure(linkId, "Unable to subscribe to peer data.")
             return
@@ -682,6 +711,7 @@ class AndroidBleTransport(
             newState: Int
         ) {
             val linkId = device.address
+            MeshLog.ble("GATT server connectionStateChange: device=$linkId, status=$status, newState=$newState")
             if (
                 status == BluetoothGatt.GATT_SUCCESS &&
                 newState == BluetoothProfile.STATE_CONNECTED
@@ -690,6 +720,7 @@ class AndroidBleTransport(
                     serverDevices[linkId] = device
                 }
             } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
+                MeshLog.ble("GATT server device $linkId disconnected.")
                 clearLink(linkId)
                 emit(
                     NearbyTransportEvent.LinkChanged(
@@ -743,6 +774,7 @@ class AndroidBleTransport(
                 value.contentEquals(
                     BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
                 )
+            MeshLog.ble("GATT server descriptorWriteRequest from ${device.address}: notificationsEnabled=$enabled")
             if (enabled) {
                 synchronized(serverSubscribers) {
                     serverSubscribers += device.address
@@ -762,6 +794,7 @@ class AndroidBleTransport(
                 )
             }
             if (enabled) {
+                MeshLog.ble("GATT server client ${device.address} subscribed to notifications -> Link Connected!")
                 emit(
                     NearbyTransportEvent.LinkChanged(
                         device.address,
@@ -776,6 +809,7 @@ class AndroidBleTransport(
                 serverNotifying -= device.address
             }
             if (status != BluetoothGatt.GATT_SUCCESS) {
+                MeshLog.warn("TRANSFER", "Encrypted BLE notification failed to ${device.address}: status=$status")
                 emitLinkFailure(
                     device.address,
                     "Encrypted BLE notification failed."
@@ -870,6 +904,7 @@ class AndroidBleTransport(
             reassembler.accept(linkId, frame)
         }.onSuccess { payload ->
             if (payload != null) {
+                MeshLog.transfer("BLE payload reassembly complete for $linkId! Total wire payload: ${payload.size} bytes")
                 emit(
                     NearbyTransportEvent.PayloadReceived(
                         linkId = linkId,
@@ -878,6 +913,7 @@ class AndroidBleTransport(
                 )
             }
         }.onFailure {
+            MeshLog.error("BLE", "Invalid BLE data frame from $linkId: ${it.message}", it)
             emitLinkFailure(
                 linkId,
                 it.transportMessage("Invalid BLE data frame")

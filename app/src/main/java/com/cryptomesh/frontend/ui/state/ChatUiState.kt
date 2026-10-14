@@ -40,7 +40,9 @@ data class ChatMessageUiModel(
     val timestamp: String,
     val isOutgoing: Boolean,
     val deliveryStatus: MessageDeliveryStatus?,
-    val createdAtEpochMillis: Long
+    val createdAtEpochMillis: Long,
+    val senderDisplayName: String? = null,
+    val senderDeviceId: String? = null
 )
 
 data class ConversationUiModel(
@@ -52,7 +54,15 @@ data class ConversationUiModel(
     val isConnected: Boolean,
     val isVerifiedSession: Boolean,
     val messages: List<ChatMessageUiModel>,
-    val mediaTransfers: List<MediaTransferUiModel> = emptyList()
+    val mediaTransfers: List<MediaTransferUiModel> = emptyList(),
+    val isGroup: Boolean = false,
+    val isBroadcastChannel: Boolean = false,
+    val memberCount: Int = 0
+)
+
+data class PeerOption(
+    val deviceId: String,
+    val displayName: String
 )
 
 data class ChatUiState(
@@ -60,5 +70,8 @@ data class ChatUiState(
     val selectedConversationId: String? = null,
     val composerText: String = "",
     val selectedAttachment: MediaAttachmentUiModel? = null,
-    val errorMessage: String? = null
+    val errorMessage: String? = null,
+    val isCreateGroupDialogOpen: Boolean = false,
+    val availablePeersForGroup: List<PeerOption> = emptyList(),
+    val groupCreationSuccessMessage: String? = null
 )

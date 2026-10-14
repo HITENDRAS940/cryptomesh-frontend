@@ -3,6 +3,7 @@ package com.cryptomesh.frontend.protocol
 import com.cryptomesh.frontend.crypto.AesGcmSessionCipher
 import com.cryptomesh.frontend.crypto.PacketSignatureService
 import com.cryptomesh.frontend.crypto.SessionCipher
+import com.cryptomesh.frontend.logging.MeshLog
 import com.cryptomesh.frontend.ui.state.LocalIdentity
 import java.security.KeyFactory
 import java.security.KeyPair
@@ -52,6 +53,7 @@ class AuthenticatedHandshake(
     private val json = Json { encodeDefaults = true }
 
     fun createHello(identity: LocalIdentity): PendingHandshake {
+        MeshLog.auth("Initiating Handshake Hello: localDeviceId=${identity.deviceId}, displayName='${identity.displayName}'")
         val ephemeralKeyPair = KeyPairGenerator.getInstance(KEY_ALGORITHM).run {
             initialize(ECGenParameterSpec(ELLIPTIC_CURVE), secureRandom)
             generateKeyPair()
@@ -71,6 +73,7 @@ class AuthenticatedHandshake(
         val signature = signatureService.sign(
             json.encodeToString(unsigned).encodeToByteArray()
         )
+        MeshLog.auth("Generated Handshake Hello: ephemeralKey=${unsigned.ephemeralPublicKeyBase64.take(16)}..., nonce=${unsigned.nonceBase64.take(16)}..., signed with identity key.")
         return PendingHandshake(
             hello = unsigned.toSigned(signature.toBase64()),
             ephemeralKeyPair = ephemeralKeyPair,
@@ -84,6 +87,7 @@ class AuthenticatedHandshake(
         remoteHello: HandshakeHello,
         expectedDeviceId: String? = null
     ): Result<AuthenticatedSession> = runCatching {
+        MeshLog.auth("Authenticating incoming Handshake: peerDeviceId=${remoteHello.deviceId}, displayName='${remoteHello.displayName}'")
         require(remoteHello.protocolVersion == PROTOCOL_VERSION) {
             "Unsupported handshake protocol version."
         }
@@ -104,6 +108,7 @@ class AuthenticatedHandshake(
         require(deviceIdForPublicKey(remoteSigningKey) == remoteHello.deviceId) {
             "Peer device ID does not match its signing key."
         }
+        MeshLog.auth("Validated peer device ID cryptographic derivation for ${remoteHello.deviceId}")
         require(
             expectedDeviceId == null ||
                 expectedDeviceId == remoteHello.deviceId
@@ -119,6 +124,7 @@ class AuthenticatedHandshake(
         require(signatureValid) {
             "Peer handshake signature verification failed."
         }
+        MeshLog.auth("Peer ECDSA handshake signature verified successfully for ${remoteHello.deviceId}")
 
         val remoteEphemeralKey = KeyFactory.getInstance(KEY_ALGORITHM)
             .generatePublic(
@@ -131,6 +137,7 @@ class AuthenticatedHandshake(
             doPhase(remoteEphemeralKey, true)
             generateSecret()
         }
+        MeshLog.auth("Computed ECDH shared secret with remote ephemeral key (${remoteHello.ephemeralPublicKeyBase64.take(16)}...)")
         val remoteNonce = remoteHello.nonceBase64.fromBase64()
         require(remoteNonce.size == HANDSHAKE_NONCE_BYTES) {
             "Peer handshake nonce is invalid."
@@ -154,6 +161,8 @@ class AuthenticatedHandshake(
                 ).encodeToByteArray(),
             outputSize = SESSION_KEY_BYTES
         )
+        MeshLog.auth("Derived AES-256-GCM session key via HKDF for ${orderedIds.joinToString("<->")}")
+        MeshLog.auth("SESSION AUTHENTICATED! Peer '${remoteHello.displayName}' (${remoteHello.deviceId}) is now securely verified.")
 
         AuthenticatedSession(
             peerDeviceId = remoteHello.deviceId,
@@ -161,6 +170,8 @@ class AuthenticatedHandshake(
             peerSigningPublicKey = remoteSigningKey,
             cipher = AesGcmSessionCipher(sessionKey)
         )
+    }.onFailure { error ->
+        MeshLog.error("AUTH", "Authentication failed with peer '${remoteHello.displayName}' (${remoteHello.deviceId}): ${error.message}", error)
     }
 
     companion object {

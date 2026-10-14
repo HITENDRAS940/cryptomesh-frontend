@@ -1,6 +1,7 @@
 package com.cryptomesh.frontend.data.repository
 
 import com.cryptomesh.frontend.crypto.PacketSignatureService
+import com.cryptomesh.frontend.logging.MeshLog
 import com.cryptomesh.frontend.protocol.AuthenticatedHandshake
 import com.cryptomesh.frontend.protocol.AuthenticatedSession
 import com.cryptomesh.frontend.protocol.DecodedDirectWireMessage
@@ -12,11 +13,17 @@ import com.cryptomesh.frontend.protocol.MediaChunkAcknowledgementPayload
 import com.cryptomesh.frontend.protocol.MediaChunkPayload
 import com.cryptomesh.frontend.protocol.MediaCompletePayload
 import com.cryptomesh.frontend.protocol.MediaKind
+import com.cryptomesh.frontend.crypto.GroupCrypto
+import com.cryptomesh.frontend.data.local.GroupEntity
+import com.cryptomesh.frontend.protocol.BroadcastTextPayload
+import com.cryptomesh.frontend.protocol.GroupInvitePayload
+import com.cryptomesh.frontend.protocol.GroupTextPayload
 import com.cryptomesh.frontend.protocol.MediaOfferPayload
 import com.cryptomesh.frontend.protocol.PendingHandshake
 import com.cryptomesh.frontend.protocol.SecurePacketCodec
 import com.cryptomesh.frontend.protocol.SecurePacketEnvelope
 import com.cryptomesh.frontend.protocol.SecurePacketType
+import com.cryptomesh.frontend.protocol.deviceIdForPublicKey
 import com.cryptomesh.frontend.transport.DiscoveredTransportPeer
 import com.cryptomesh.frontend.transport.LocalTransportNode
 import com.cryptomesh.frontend.transport.NearbyTransport
@@ -69,8 +76,32 @@ data class DirectMessage(
     val text: String,
     val sentAtEpochMillis: Long,
     val isOutgoing: Boolean,
-    val status: DirectMessageStatus
+    val status: DirectMessageStatus,
+    val groupId: String? = null,
+    val senderDisplayName: String? = null
 )
+
+data class DirectGroup(
+    val groupId: String,
+    val groupName: String,
+    val isBroadcastChannel: Boolean,
+    val creatorDeviceId: String,
+    val members: List<String>,
+    val createdAtEpochMillis: Long,
+    val lastActivityEpochMillis: Long
+)
+
+fun GroupEntity.toDirectGroup(): DirectGroup {
+    return DirectGroup(
+        groupId = groupId,
+        groupName = groupName,
+        isBroadcastChannel = isBroadcastChannel,
+        creatorDeviceId = creatorDeviceId,
+        members = getMemberList(),
+        createdAtEpochMillis = createdAtEpochMillis,
+        lastActivityEpochMillis = lastActivityEpochMillis
+    )
+}
 
 data class DirectMediaTransfer(
     val transferId: String,
@@ -95,7 +126,8 @@ data class DirectMeshState(
     val scanError: String? = null,
     val peers: List<DirectPeer> = emptyList(),
     val messages: List<DirectMessage> = emptyList(),
-    val mediaTransfers: List<DirectMediaTransfer> = emptyList()
+    val mediaTransfers: List<DirectMediaTransfer> = emptyList(),
+    val groups: List<DirectGroup> = emptyList()
 )
 
 interface DirectMeshRepository {
@@ -112,6 +144,12 @@ interface DirectMeshRepository {
     fun disconnect(linkId: String)
 
     suspend fun sendText(peerDeviceId: String, text: String): Result<String>
+
+    suspend fun createGroup(name: String, memberDeviceIds: List<String>): Result<DirectGroup>
+
+    suspend fun sendGroupText(groupId: String, text: String): Result<String>
+
+    suspend fun sendBroadcastText(channelId: String, text: String): Result<String>
 
     suspend fun sendMedia(
         peerDeviceId: String,
@@ -136,6 +174,7 @@ class BleDirectMeshRepository(
     private val mediaFileStore: MediaFileStore,
     private val transport: NearbyTransport,
     private val applicationScope: CoroutineScope,
+    private val groupRepository: GroupRepository = MemoryGroupRepository(),
     private val now: () -> Long = System::currentTimeMillis,
     private val wireCodec: DirectWireCodec = DirectWireCodec(),
     private val mediaTransferEngine: MediaTransferEngine =
@@ -172,14 +211,25 @@ class BleDirectMeshRepository(
                         sessionsByDeviceId.clear()
                         forwardedPacketLinks.clear()
                         transport.close()
+                        groupRepository.clearAll()
                         _state.value = DirectMeshState()
                     }
                     localIdentity = identity
+                    if (identity != null) {
+                        groupRepository.initDefaultChannels(identity.deviceId)
+                    }
                 }
         }
         applicationScope.launch {
             packetRepository.packets.collect { packets ->
                 cachedPackets = packets
+            }
+        }
+        applicationScope.launch {
+            groupRepository.groups.collect { groups ->
+                _state.update {
+                    it.copy(groups = groups.map(GroupEntity::toDirectGroup))
+                }
             }
         }
         applicationScope.launch {
@@ -342,6 +392,7 @@ class BleDirectMeshRepository(
         val identity = requireNotNull(localIdentity) {
             "Local identity is not ready."
         }
+        MeshLog.transfer("Initiating sendText to peerDeviceId=$peerDeviceId: \"$cleanText\"")
         val peer = _state.value.peers.firstOrNull {
             it.deviceId == peerDeviceId && it.isVerified
         } ?: error("Peer has not been authenticated.")
@@ -366,6 +417,7 @@ class BleDirectMeshRepository(
             ),
             expiresAtEpochMillis = sentAt + MESSAGE_TTL_MILLIS
         )
+        MeshLog.packet("Direct text sealed: packetId=${envelope.packetId}, cipherChars=${envelope.encryptedPayloadBase64.length}, TTL=${MESSAGE_TTL_MILLIS}ms, queuing...")
         packetRepository.storeIfAbsent(
             envelope = envelope,
             status = PersistedPacketStatus.Queued,
@@ -394,6 +446,7 @@ class BleDirectMeshRepository(
         }
         envelope.packetId
     }.onFailure {
+        MeshLog.error("TRANSFER", "Failed to send direct text to peer $peerDeviceId: ${it.message}", it)
         val pendingMessage = _state.value.messages.lastOrNull {
             it.peerDeviceId == peerDeviceId &&
                 it.isOutgoing &&
@@ -411,9 +464,210 @@ class BleDirectMeshRepository(
         }
     }
 
+    override suspend fun createGroup(
+        name: String,
+        memberDeviceIds: List<String>
+    ): Result<DirectGroup> = runCatching {
+        val cleanName = name.trim()
+        require(cleanName.isNotEmpty()) { "Group name cannot be empty." }
+        val identity = requireNotNull(localIdentity) { "Local identity is not ready." }
+        val group = groupRepository.createGroup(
+            name = cleanName,
+            creatorDeviceId = identity.deviceId,
+            memberDeviceIds = memberDeviceIds
+        )
+        memberDeviceIds.forEach { memberId ->
+            if (memberId != identity.deviceId) {
+                sendGroupInvite(group, memberId)
+            }
+        }
+        group.toDirectGroup()
+    }
+
+    private suspend fun sendGroupInvite(group: GroupEntity, recipientDeviceId: String) {
+        val identity = localIdentity ?: return
+        val session = currentSessionFor(recipientDeviceId) ?: run {
+            MeshLog.warn("TRANSFER", "Cannot send group invite to $recipientDeviceId: no active session.")
+            return
+        }
+        MeshLog.transfer("Sending group invite for '${group.groupName}' (${group.groupId}) to recipient $recipientDeviceId")
+        val codec = SecurePacketCodec(session.cipher, signatureService, now)
+        val sentAt = now()
+        val payload = wireCodec.encodeGroupInvite(
+            GroupInvitePayload(
+                groupId = group.groupId,
+                groupName = group.groupName,
+                groupKeyBase64 = group.groupKeyBase64,
+                creatorDeviceId = group.creatorDeviceId,
+                members = group.getMemberList(),
+                createdAtEpochMillis = sentAt
+            )
+        )
+        val envelope = codec.seal(
+            packetType = SecurePacketType.GroupInvite,
+            senderId = identity.deviceId,
+            receiverId = recipientDeviceId,
+            payload = payload,
+            expiresAtEpochMillis = sentAt + MESSAGE_TTL_MILLIS
+        )
+        MeshLog.packet("Group invite sealed: packetId=${envelope.packetId}, forwarding to mesh...")
+        packetRepository.storeIfAbsent(
+            envelope = envelope,
+            status = PersistedPacketStatus.Queued,
+            ownership = PacketOwnership.Own
+        )
+        forwardEnvelopeToMesh(envelope)
+    }
+
+    override suspend fun sendGroupText(
+        groupId: String,
+        text: String
+    ): Result<String> = runCatching {
+        val cleanText = text.trim()
+        require(cleanText.isNotEmpty()) { "Message cannot be empty." }
+        require(cleanText.length <= MAX_TEXT_LENGTH) {
+            "Message exceeds $MAX_TEXT_LENGTH characters."
+        }
+        val identity = requireNotNull(localIdentity) { "Local identity is not ready." }
+        val group = requireNotNull(groupRepository.getGroup(groupId)) {
+            "Group not found: $groupId"
+        }
+        MeshLog.transfer("Initiating sendGroupText to group '${group.groupName}' ($groupId): \"$cleanText\"")
+        val groupKey = GroupCrypto.decodeKey(group.groupKeyBase64)
+        val cipher = GroupCrypto.createGroupCipher(groupKey)
+        val codec = SecurePacketCodec(
+            sessionCipher = cipher,
+            signatureService = signatureService,
+            now = now
+        )
+        val sentAt = now()
+        val envelope = codec.seal(
+            packetType = SecurePacketType.GroupMessage,
+            senderId = identity.deviceId,
+            receiverId = groupId,
+            payload = wireCodec.encodeGroupText(
+                GroupTextPayload(
+                    groupId = groupId,
+                    groupName = group.groupName,
+                    senderDisplayName = identity.displayName,
+                    text = cleanText,
+                    sentAtEpochMillis = sentAt,
+                    senderPublicKeyBase64 = Base64.getEncoder().encodeToString(signatureService.publicKeyBytes)
+                )
+            ),
+            expiresAtEpochMillis = sentAt + MESSAGE_TTL_MILLIS
+        )
+        MeshLog.packet("Group message sealed: packetId=${envelope.packetId}, payloadCipherChars=${envelope.encryptedPayloadBase64.length}, forwarding to mesh...")
+        packetRepository.storeIfAbsent(
+            envelope = envelope,
+            status = PersistedPacketStatus.Queued,
+            ownership = PacketOwnership.Own
+        )
+        upsertMessage(
+            DirectMessage(
+                packetId = envelope.packetId,
+                peerDeviceId = identity.deviceId,
+                text = cleanText,
+                sentAtEpochMillis = sentAt,
+                isOutgoing = true,
+                status = DirectMessageStatus.Queued,
+                groupId = groupId,
+                senderDisplayName = identity.displayName
+            )
+        )
+        groupRepository.updateLastActivity(groupId, sentAt)
+        val forwarded = forwardEnvelopeToMesh(envelope)
+        if (forwarded) {
+            packetRepository.updateStatus(
+                envelope.packetId,
+                PersistedPacketStatus.Acknowledged
+            )
+            updateMessageStatus(
+                envelope.packetId,
+                DirectMessageStatus.Acknowledged
+            )
+        }
+        envelope.packetId
+    }
+
+    override suspend fun sendBroadcastText(
+        channelId: String,
+        text: String
+    ): Result<String> = runCatching {
+        val cleanText = text.trim()
+        require(cleanText.isNotEmpty()) { "Message cannot be empty." }
+        require(cleanText.length <= MAX_TEXT_LENGTH) {
+            "Message exceeds $MAX_TEXT_LENGTH characters."
+        }
+        val identity = requireNotNull(localIdentity) { "Local identity is not ready." }
+        val group = groupRepository.getGroup(channelId)
+        val channelKey = if (group != null) {
+            GroupCrypto.decodeKey(group.groupKeyBase64)
+        } else {
+            GroupCrypto.deriveBroadcastKey(channelId)
+        }
+        val channelName = group?.groupName ?: if (channelId == RoomGroupRepository.CHANNEL_EMERGENCY_ID) "#emergency" else "#general"
+        MeshLog.transfer("Initiating sendBroadcastText to channel '$channelName' ($channelId): \"$cleanText\"")
+        val cipher = GroupCrypto.createGroupCipher(channelKey)
+        val codec = SecurePacketCodec(
+            sessionCipher = cipher,
+            signatureService = signatureService,
+            now = now
+        )
+        val sentAt = now()
+        val envelope = codec.seal(
+            packetType = SecurePacketType.BroadcastMessage,
+            senderId = identity.deviceId,
+            receiverId = channelId,
+            payload = wireCodec.encodeBroadcastText(
+                BroadcastTextPayload(
+                    channelId = channelId,
+                    channelName = channelName,
+                    senderDisplayName = identity.displayName,
+                    text = cleanText,
+                    sentAtEpochMillis = sentAt,
+                    senderPublicKeyBase64 = Base64.getEncoder().encodeToString(signatureService.publicKeyBytes)
+                )
+            ),
+            expiresAtEpochMillis = sentAt + MESSAGE_TTL_MILLIS
+        )
+        MeshLog.packet("Broadcast message sealed: packetId=${envelope.packetId}, payloadCipherChars=${envelope.encryptedPayloadBase64.length}, forwarding to mesh...")
+        packetRepository.storeIfAbsent(
+            envelope = envelope,
+            status = PersistedPacketStatus.Queued,
+            ownership = PacketOwnership.Own
+        )
+        upsertMessage(
+            DirectMessage(
+                packetId = envelope.packetId,
+                peerDeviceId = identity.deviceId,
+                text = cleanText,
+                sentAtEpochMillis = sentAt,
+                isOutgoing = true,
+                status = DirectMessageStatus.Queued,
+                groupId = channelId,
+                senderDisplayName = identity.displayName
+            )
+        )
+        groupRepository.updateLastActivity(channelId, sentAt)
+        val forwarded = forwardEnvelopeToMesh(envelope)
+        if (forwarded) {
+            packetRepository.updateStatus(
+                envelope.packetId,
+                PersistedPacketStatus.Acknowledged
+            )
+            updateMessageStatus(
+                envelope.packetId,
+                DirectMessageStatus.Acknowledged
+            )
+        }
+        envelope.packetId
+    }
+
     private suspend fun handleTransportEvent(event: NearbyTransportEvent) {
         when (event) {
             is NearbyTransportEvent.Availability -> {
+                MeshLog.ble("Transport availability changed: available=${event.available}, advertising=${event.advertising}, message=${event.message ?: "none"}")
                 _state.update {
                     it.copy(
                         transportAvailable = event.available,
@@ -432,6 +686,7 @@ class BleDirectMeshRepository(
             }
 
             is NearbyTransportEvent.ScanChanged -> {
+                MeshLog.ble("Transport scan status changed: scanning=${event.scanning}, error=${event.error ?: "none"}")
                 _state.update {
                     it.copy(
                         isScanning = event.scanning,
@@ -441,14 +696,17 @@ class BleDirectMeshRepository(
             }
 
             is NearbyTransportEvent.PeerFound -> {
+                MeshLog.ble("Transport peer found: linkId=${event.peer.linkId}, advertisedId=${event.peer.advertisedDeviceId ?: "unknown"}, rssi=${event.peer.signalStrength}dBm")
                 addDiscoveredPeer(event.peer)
             }
 
             is NearbyTransportEvent.LinkChanged -> {
+                MeshLog.ble("Transport link changed: linkId=${event.linkId}, status=${event.status}, msg=${event.message ?: "none"}")
                 handleLinkChanged(event)
             }
 
             is NearbyTransportEvent.PayloadReceived -> {
+                MeshLog.transfer("Transport payload received: linkId=${event.linkId}, size=${event.payload.size} bytes")
                 handlePayload(event.linkId, event.payload)
             }
         }
@@ -482,16 +740,23 @@ class BleDirectMeshRepository(
         event: NearbyTransportEvent.LinkChanged
     ) {
         when (event.status) {
-            TransportLinkStatus.Connecting -> updatePeer(event.linkId) {
-                it.copy(
-                    status = DirectPeerStatus.Connecting,
-                    failureMessage = null
-                )
+            TransportLinkStatus.Connecting -> {
+                MeshLog.ble("Link ${event.linkId} connecting...")
+                updatePeer(event.linkId) {
+                    it.copy(
+                        status = DirectPeerStatus.Connecting,
+                        failureMessage = null
+                    )
+                }
             }
 
-            TransportLinkStatus.Connected -> beginHandshake(event.linkId)
+            TransportLinkStatus.Connected -> {
+                MeshLog.ble("Link ${event.linkId} connected! Initiating mutual authentication...")
+                beginHandshake(event.linkId)
+            }
 
             TransportLinkStatus.Disconnected -> {
+                MeshLog.ble("Link ${event.linkId} disconnected. Clearing sessions.")
                 pendingHandshakes.remove(event.linkId)
                 removeSessionForLink(event.linkId)
                 updatePeer(event.linkId) {
@@ -507,6 +772,7 @@ class BleDirectMeshRepository(
             }
 
             TransportLinkStatus.Failed -> {
+                MeshLog.warn("BLE", "Link ${event.linkId} failed: ${event.message}")
                 pendingHandshakes.remove(event.linkId)
                 removeSessionForLink(event.linkId)
                 ensurePeer(event.linkId)
@@ -523,8 +789,12 @@ class BleDirectMeshRepository(
     }
 
     private fun beginHandshake(linkId: String) {
-        if (sessions.containsKey(linkId)) return
+        if (sessions.containsKey(linkId)) {
+            MeshLog.auth("Handshake skipped for linkId=$linkId: session already established.")
+            return
+        }
         val identity = localIdentity ?: run {
+            MeshLog.warn("AUTH", "Cannot begin handshake for linkId=$linkId: local identity not ready.")
             markAuthenticationFailure(
                 linkId,
                 "Local identity is not ready."
@@ -541,10 +811,12 @@ class BleDirectMeshRepository(
         val pending = pendingHandshakes.getOrPut(linkId) {
             handshake.createHello(identity)
         }
+        MeshLog.auth("Initiating handshake with linkId=$linkId: sending HandshakeHello (device=${identity.deviceId.take(8)}..., ephemeralKey=${pending.hello.ephemeralPublicKeyBase64.take(16)}...)")
         transport.send(
             linkId,
             wireCodec.encodeHandshake(pending.hello)
         ).onFailure {
+            MeshLog.error("AUTH", "Failed to send HandshakeHello to linkId=$linkId: ${it.message}")
             markAuthenticationFailure(
                 linkId,
                 it.message ?: "Unable to send authenticated handshake."
@@ -553,19 +825,23 @@ class BleDirectMeshRepository(
     }
 
     private suspend fun handlePayload(linkId: String, payload: ByteArray) {
+        MeshLog.transfer("Decoding incoming wire message from linkId=$linkId (${payload.size} bytes)...")
         runCatching {
             wireCodec.decode(payload)
         }.onSuccess { decoded ->
             when (decoded) {
                 is DecodedDirectWireMessage.Handshake -> {
+                    MeshLog.auth("Wire message decoded as HandshakeHello from linkId=$linkId")
                     handleHandshake(linkId, decoded)
                 }
 
                 is DecodedDirectWireMessage.Packet -> {
+                    MeshLog.packet("Wire message decoded as SecurePacket from linkId=$linkId (packetId=${decoded.envelope.packetId}, type=${decoded.envelope.packetType})")
                     handleSecurePacket(linkId, decoded)
                 }
             }
         }.onFailure {
+            MeshLog.error("TRANSFER", "Failed to decode wire payload from linkId=$linkId: ${it.message}")
             markAuthenticationFailure(
                 linkId,
                 it.message ?: "Peer sent an invalid wire message."
@@ -577,16 +853,22 @@ class BleDirectMeshRepository(
         linkId: String,
         message: DecodedDirectWireMessage.Handshake
     ) {
-        if (sessions.containsKey(linkId)) return
+        if (sessions.containsKey(linkId)) {
+            MeshLog.auth("handleHandshake: linkId=$linkId already authenticated.")
+            return
+        }
         val identity = localIdentity ?: return
         ensurePeer(linkId)
+        MeshLog.auth("Processing peer HandshakeHello on linkId=$linkId from peerDisplayName='${message.hello.displayName}' (device=${message.hello.deviceId.take(8)}...)")
         val pending = pendingHandshakes[linkId] ?: run {
             val created = handshake.createHello(identity)
             pendingHandshakes[linkId] = created
+            MeshLog.auth("Responding with our HandshakeHello to linkId=$linkId...")
             transport.send(
                 linkId,
                 wireCodec.encodeHandshake(created.hello)
             ).getOrElse {
+                MeshLog.error("AUTH", "Unable to answer peer handshake on linkId=$linkId: ${it.message}")
                 markAuthenticationFailure(
                     linkId,
                     it.message ?: "Unable to answer peer handshake."
@@ -604,6 +886,7 @@ class BleDirectMeshRepository(
             remoteHello = message.hello,
             expectedDeviceId = discoveredDeviceId
         ).onSuccess { session ->
+            MeshLog.auth("Mutual authentication SUCCEEDED for linkId=$linkId! Peer verified: deviceId=${session.peerDeviceId}, name='${session.peerDisplayName}'")
             sessions[linkId] = session
             rememberSession(session)
             pendingHandshakes.remove(linkId)
@@ -620,6 +903,7 @@ class BleDirectMeshRepository(
                 flushPacketsForLink(linkId)
             }
         }.onFailure {
+            MeshLog.error("AUTH", "Mutual authentication FAILED for linkId=$linkId: ${it.message}", it)
             markAuthenticationFailure(
                 linkId,
                 it.message ?: "Peer authentication failed."
@@ -633,15 +917,18 @@ class BleDirectMeshRepository(
         message: DecodedDirectWireMessage.Packet
     ) {
         val identity = localIdentity ?: return
+        val envelope = message.envelope
+        MeshLog.packet("Processing SecurePacket id=${envelope.packetId}, type=${envelope.packetType}, sender=${envelope.senderId.take(8)}..., receiver=${envelope.receiverId.take(8)}..., wireLink=$linkId")
         sessions[linkId] ?: run {
+            MeshLog.warn("AUTH", "SecurePacket rejected: Encrypted data arrived before peer authentication on linkId=$linkId")
             markAuthenticationFailure(
                 linkId,
                 "Encrypted data arrived before peer authentication."
             )
             return
         }
-        val envelope = message.envelope
         if (isExpired(envelope)) {
+            MeshLog.warn("PACKET", "SecurePacket id=${envelope.packetId} has expired (TTL exceeded). Discarding.")
             packetRepository.storeIfAbsent(
                 envelope = envelope,
                 status = PersistedPacketStatus.Expired,
@@ -649,12 +936,28 @@ class BleDirectMeshRepository(
             )
             return
         }
-        if (envelope.senderId == identity.deviceId) return
+        if (envelope.senderId == identity.deviceId) {
+            MeshLog.packet("SecurePacket id=${envelope.packetId} originated from self (${identity.deviceId.take(8)}...). Ignoring loopback.")
+            return
+        }
+        if (envelope.packetType == SecurePacketType.GroupMessage) {
+            MeshLog.packet("SecurePacket id=${envelope.packetId} is a GroupMessage for group=${envelope.receiverId}. Handling group payload...")
+            receiveGroupMessage(linkId, envelope)
+            return
+        }
+        if (envelope.packetType == SecurePacketType.BroadcastMessage) {
+            MeshLog.packet("SecurePacket id=${envelope.packetId} is a BroadcastMessage for channel=${envelope.receiverId}. Handling broadcast...")
+            receiveBroadcastMessage(linkId, envelope)
+            return
+        }
         if (envelope.receiverId != identity.deviceId) {
+            MeshLog.transfer("SecurePacket id=${envelope.packetId} is destined for ${envelope.receiverId.take(8)}... (Relay needed). Relaying to mesh...")
             receiveRelayPacket(linkId, envelope, identity.deviceId)
             return
         }
+        MeshLog.packet("SecurePacket id=${envelope.packetId} is directed to this device. Opening payload with peer session...")
         val plaintext = openWithKnownPeerSession(envelope) ?: run {
+            MeshLog.warn("PACKET", "Unable to decrypt packet id=${envelope.packetId} with known sessions. Storing for relay queue.")
             packetRepository.storeIfAbsent(
                 envelope = envelope,
                 status = PersistedPacketStatus.Queued,
@@ -662,11 +965,20 @@ class BleDirectMeshRepository(
             )
             return
         }
+        MeshLog.packet("SecurePacket id=${envelope.packetId} decrypted successfully (${plaintext.size} bytes)! Dispatching type=${envelope.packetType}...")
         runCatching {
             when (envelope.packetType) {
                 SecurePacketType.Message -> {
                     receiveText(envelope, plaintext)
                 }
+
+                SecurePacketType.GroupInvite -> {
+                    receiveGroupInvite(envelope, plaintext)
+                }
+
+                SecurePacketType.GroupMessage -> Unit
+
+                SecurePacketType.BroadcastMessage -> Unit
 
                 SecurePacketType.Acknowledgement -> {
                     receiveAcknowledgement(plaintext)
@@ -699,6 +1011,7 @@ class BleDirectMeshRepository(
                 }
             }
         }.onFailure {
+            MeshLog.error("PACKET", "Failed to process decrypted packet ${envelope.packetId}: ${it.message}", it)
             updatePeer(linkId) { peer ->
                 peer.copy(
                     failureMessage = it.message
@@ -708,11 +1021,162 @@ class BleDirectMeshRepository(
         }
     }
 
+    private suspend fun receiveGroupInvite(
+        envelope: SecurePacketEnvelope,
+        plaintext: ByteArray
+    ) {
+        val invite = wireCodec.decodeGroupInvite(plaintext)
+        MeshLog.packet("Received group invite for group '${invite.groupName}' (${invite.groupId}) from ${invite.creatorDeviceId.take(8)}...")
+        val inserted = packetRepository.storeIfAbsent(
+            envelope = envelope,
+            status = PersistedPacketStatus.Acknowledged,
+            ownership = PacketOwnership.Own
+        )
+        if (inserted) {
+            groupRepository.joinGroup(
+                GroupEntity(
+                    groupId = invite.groupId,
+                    groupName = invite.groupName,
+                    isBroadcastChannel = false,
+                    creatorDeviceId = invite.creatorDeviceId,
+                    groupKeyBase64 = invite.groupKeyBase64,
+                    membersCsv = invite.members.joinToString(","),
+                    createdAtEpochMillis = invite.createdAtEpochMillis,
+                    lastActivityEpochMillis = now()
+                )
+            )
+        }
+        sendAcknowledgement(
+            receiverDeviceId = envelope.senderId,
+            acknowledgedPacketId = envelope.packetId
+        )
+    }
+
+    private suspend fun receiveGroupMessage(
+        incomingLinkId: String,
+        envelope: SecurePacketEnvelope
+    ) {
+        val inserted = packetRepository.storeIfAbsent(
+            envelope = envelope,
+            status = PersistedPacketStatus.Acknowledged,
+            ownership = PacketOwnership.Own
+        )
+        if (inserted) {
+            val group = groupRepository.getGroup(envelope.receiverId)
+            if (group != null) {
+                runCatching {
+                    val groupKey = GroupCrypto.decodeKey(group.groupKeyBase64)
+                    val cipher = GroupCrypto.createGroupCipher(groupKey)
+                    val plaintext = openGroupEnvelope(envelope, cipher)
+                    if (plaintext != null) {
+                        val groupText = wireCodec.decodeGroupText(plaintext)
+                        MeshLog.packet("Received group message in '${group.groupName}' from ${groupText.senderDisplayName} (${envelope.senderId.take(8)}...): \"${groupText.text}\" (packetId=${envelope.packetId})")
+                        upsertMessage(
+                            DirectMessage(
+                                packetId = envelope.packetId,
+                                peerDeviceId = envelope.senderId,
+                                text = groupText.text,
+                                sentAtEpochMillis = groupText.sentAtEpochMillis,
+                                isOutgoing = false,
+                                status = DirectMessageStatus.Acknowledged,
+                                groupId = group.groupId,
+                                senderDisplayName = groupText.senderDisplayName
+                            )
+                        )
+                        groupRepository.updateLastActivity(group.groupId, groupText.sentAtEpochMillis)
+                    } else {
+                        MeshLog.warn("PACKET", "Failed to decrypt group message envelope for group ${group.groupName}")
+                    }
+                }.onFailure {
+                    MeshLog.error("PACKET", "Error processing group message: ${it.message}", it)
+                }
+            } else {
+                MeshLog.warn("PACKET", "Received group packet for unknown group ${envelope.receiverId}")
+            }
+        }
+        MeshLog.transfer("Flooding GroupMessage packetId=${envelope.packetId} across mesh (excluding linkId=$incomingLinkId)...")
+        forwardEnvelopeToMesh(envelope, incomingLinkId)
+    }
+
+    private suspend fun receiveBroadcastMessage(
+        incomingLinkId: String,
+        envelope: SecurePacketEnvelope
+    ) {
+        val inserted = packetRepository.storeIfAbsent(
+            envelope = envelope,
+            status = PersistedPacketStatus.Acknowledged,
+            ownership = PacketOwnership.Own
+        )
+        if (inserted) {
+            runCatching {
+                val channelKey = GroupCrypto.deriveBroadcastKey(envelope.receiverId)
+                val cipher = GroupCrypto.createGroupCipher(channelKey)
+                val plaintext = openGroupEnvelope(envelope, cipher)
+                if (plaintext != null) {
+                    val broadcastText = wireCodec.decodeBroadcastText(plaintext)
+                    MeshLog.packet("Received broadcast message in '${broadcastText.channelName}' from ${broadcastText.senderDisplayName} (${envelope.senderId.take(8)}...): \"${broadcastText.text}\" (packetId=${envelope.packetId})")
+                    upsertMessage(
+                        DirectMessage(
+                            packetId = envelope.packetId,
+                            peerDeviceId = envelope.senderId,
+                            text = broadcastText.text,
+                            sentAtEpochMillis = broadcastText.sentAtEpochMillis,
+                            isOutgoing = false,
+                            status = DirectMessageStatus.Acknowledged,
+                            groupId = broadcastText.channelId,
+                            senderDisplayName = broadcastText.senderDisplayName
+                        )
+                    )
+                    groupRepository.updateLastActivity(broadcastText.channelId, broadcastText.sentAtEpochMillis)
+                } else {
+                    MeshLog.warn("PACKET", "Failed to decrypt broadcast message envelope for channel ${envelope.receiverId}")
+                }
+            }.onFailure {
+                MeshLog.error("PACKET", "Error processing broadcast message: ${it.message}", it)
+            }
+        }
+        MeshLog.transfer("Flooding BroadcastMessage packetId=${envelope.packetId} across mesh (excluding linkId=$incomingLinkId)...")
+        forwardEnvelopeToMesh(envelope, incomingLinkId)
+    }
+
+    private fun openGroupEnvelope(
+        envelope: SecurePacketEnvelope,
+        cipher: com.cryptomesh.frontend.crypto.SessionCipher
+    ): ByteArray? = runCatching {
+        val directKey = sessionsByDeviceId[envelope.senderId]
+            ?.firstOrNull()
+            ?.peerSigningPublicKey
+
+        val codec = SecurePacketCodec(cipher, signatureService, now)
+        if (directKey != null) {
+            val opened = codec.open(envelope, directKey).getOrNull()
+            if (opened != null) return opened
+        }
+
+        val unverified = codec.decryptPayloadWithoutVerification(envelope).getOrNull() ?: return null
+        val json = kotlinx.serialization.json.Json { ignoreUnknownKeys = true }
+        val payloadStr = unverified.decodeToString()
+        val pubKeyBase64 = runCatching {
+            json.decodeFromString<GroupTextPayload>(payloadStr).senderPublicKeyBase64
+        }.getOrNull() ?: runCatching {
+            json.decodeFromString<BroadcastTextPayload>(payloadStr).senderPublicKeyBase64
+        }.getOrNull()
+
+        if (pubKeyBase64 != null) {
+            val pubKeyBytes = Base64.getDecoder().decode(pubKeyBase64)
+            if (deviceIdForPublicKey(pubKeyBytes) == envelope.senderId) {
+                return codec.open(envelope, pubKeyBytes).getOrNull()
+            }
+        }
+        null
+    }.getOrNull()
+
     private suspend fun receiveRelayPacket(
         incomingLinkId: String,
         envelope: SecurePacketEnvelope,
         localDeviceId: String
     ) {
+        MeshLog.transfer("Relay packet received: packetId=${envelope.packetId}, sender=${envelope.senderId.take(8)}..., dest=${envelope.receiverId.take(8)}..., incomingLink=$incomingLinkId")
         packetRepository.storeIfAbsent(
             envelope = envelope,
             status = PersistedPacketStatus.Queued,
@@ -728,6 +1192,7 @@ class BleDirectMeshRepository(
         plaintext: ByteArray
     ) {
         val text = wireCodec.decodeTextPayload(plaintext)
+        MeshLog.packet("Received direct message from ${envelope.senderId.take(8)}...: \"${text.text}\" (packetId=${envelope.packetId})")
         val inserted = packetRepository.storeIfAbsent(
             envelope = envelope,
             status = PersistedPacketStatus.Acknowledged,
@@ -745,6 +1210,7 @@ class BleDirectMeshRepository(
                 )
             )
         }
+        MeshLog.transfer("Sending direct ACK for packetId=${envelope.packetId} to ${envelope.senderId.take(8)}...")
         sendAcknowledgement(
             receiverDeviceId = envelope.senderId,
             acknowledgedPacketId = envelope.packetId
@@ -1036,7 +1502,10 @@ class BleDirectMeshRepository(
         acknowledgedPacketId: String
     ) {
         val identity = localIdentity ?: return
-        val session = currentSessionFor(receiverDeviceId) ?: return
+        val session = currentSessionFor(receiverDeviceId) ?: run {
+            MeshLog.warn("TRANSFER", "Cannot send ACK for packetId=$acknowledgedPacketId: no active session for receiver $receiverDeviceId")
+            return
+        }
         val sentAt = now()
         val envelope = SecurePacketCodec(
             sessionCipher = session.cipher,
@@ -1054,6 +1523,7 @@ class BleDirectMeshRepository(
             ),
             expiresAtEpochMillis = sentAt + ACK_TTL_MILLIS
         )
+        MeshLog.transfer("Generated & sealed ACK packet id=${envelope.packetId} for target packetId=$acknowledgedPacketId to receiver ${receiverDeviceId.take(8)}...")
         packetRepository.storeIfAbsent(
             envelope = envelope,
             status = PersistedPacketStatus.Queued,
@@ -1064,6 +1534,7 @@ class BleDirectMeshRepository(
 
     private suspend fun receiveAcknowledgement(plaintext: ByteArray) {
         val acknowledgement = wireCodec.decodeAcknowledgement(plaintext)
+        MeshLog.transfer("Delivery ACK RECEIVED for packetId=${acknowledgement.acknowledgedPacketId} (status -> Acknowledged)!")
         packetRepository.updateStatus(
             acknowledgement.acknowledgedPacketId,
             PersistedPacketStatus.Acknowledged
@@ -1087,6 +1558,7 @@ class BleDirectMeshRepository(
         payload: ByteArray,
         expiresAtEpochMillis: Long
     ): String {
+        MeshLog.transfer("Sealing media packet: type=$packetType, sender=${senderId.take(8)}..., receiver=${receiverId.take(8)}...")
         val session = requireNotNull(currentSessionFor(receiverId)) {
             "Authenticated peer session key is not ready."
         }
@@ -1101,6 +1573,7 @@ class BleDirectMeshRepository(
             payload = payload,
             expiresAtEpochMillis = expiresAtEpochMillis
         )
+        MeshLog.packet("Media packet sealed: id=${envelope.packetId}, payloadCipherChars=${envelope.encryptedPayloadBase64.length}, forwarding to mesh...")
         packetRepository.storeIfAbsent(
             envelope = envelope,
             status = PersistedPacketStatus.Queued,
@@ -1476,16 +1949,19 @@ class BleDirectMeshRepository(
     }
 
     private suspend fun flushPacketsForLink(linkId: String) {
-        cachedPackets
+        val forwardable = cachedPackets
             .filter(::isForwardablePacket)
             .map(StoredSecurePacket::envelope)
             .filter { envelope ->
                 candidateLinksFor(envelope, incomingLinkId = null)
                     .contains(linkId)
             }
-            .forEach { envelope ->
-                forwardEnvelopeToLink(linkId, envelope)
-            }
+        if (forwardable.isNotEmpty()) {
+            MeshLog.transfer("Flushing ${forwardable.size} queued packets for newly authenticated linkId=$linkId...")
+        }
+        forwardable.forEach { envelope ->
+            forwardEnvelopeToLink(linkId, envelope)
+        }
     }
 
     private suspend fun forwardEnvelopeToMesh(
@@ -1493,6 +1969,7 @@ class BleDirectMeshRepository(
         incomingLinkId: String? = null
     ): Boolean {
         val candidateLinks = candidateLinksFor(envelope, incomingLinkId)
+        MeshLog.transfer("forwardEnvelopeToMesh: packetId=${envelope.packetId}, type=${envelope.packetType}, candidateLinks=${candidateLinks.size} (${candidateLinks.joinToString()})")
         var forwarded = false
         candidateLinks.forEach { linkId ->
             forwarded = forwardEnvelopeToLink(linkId, envelope) || forwarded
@@ -1505,6 +1982,7 @@ class BleDirectMeshRepository(
         envelope: SecurePacketEnvelope
     ): Boolean {
         if (isExpired(envelope)) {
+            MeshLog.warn("TRANSFER", "Cannot forward expired packetId=${envelope.packetId} to linkId=$linkId")
             packetRepository.updateStatus(
                 envelope.packetId,
                 PersistedPacketStatus.Expired
@@ -1516,18 +1994,25 @@ class BleDirectMeshRepository(
             return false
         }
         val packetLinkKey = "${envelope.packetId}:$linkId"
-        if (!forwardedPacketLinks.add(packetLinkKey)) return false
+        if (!forwardedPacketLinks.add(packetLinkKey)) {
+            MeshLog.transfer("Packet packetId=${envelope.packetId} already forwarded to linkId=$linkId. Skipping duplicate.")
+            return false
+        }
+        val wireBytes = wireCodec.encodePacket(envelope)
+        MeshLog.transfer("Transmitting packetId=${envelope.packetId} over linkId=$linkId (${wireBytes.size} wire bytes)...")
         return transport.send(
             linkId,
-            wireCodec.encodePacket(envelope)
+            wireBytes
         ).onSuccess {
             val status = if (envelope.senderId == localIdentity?.deviceId) {
                 PersistedPacketStatus.AwaitingAcknowledgement
             } else {
                 PersistedPacketStatus.Forwarding
             }
+            MeshLog.transfer("Successfully transmitted packetId=${envelope.packetId} over linkId=$linkId (status=$status)")
             packetRepository.updateStatus(envelope.packetId, status)
         }.onFailure {
+            MeshLog.warn("TRANSFER", "Failed to transmit packetId=${envelope.packetId} over linkId=$linkId: ${it.message}")
             forwardedPacketLinks.remove(packetLinkKey)
         }.isSuccess
     }

@@ -10,6 +10,8 @@ import com.cryptomesh.frontend.data.repository.LocalMediaFileStore
 import com.cryptomesh.frontend.data.repository.RoomIdentityRepository
 import com.cryptomesh.frontend.data.repository.MediaTransferRepository
 import com.cryptomesh.frontend.data.repository.RoomMediaTransferRepository
+import com.cryptomesh.frontend.data.repository.GroupRepository
+import com.cryptomesh.frontend.data.repository.RoomGroupRepository
 import com.cryptomesh.frontend.data.repository.RoomSecurePacketRepository
 import com.cryptomesh.frontend.data.repository.SecurePacketRepository
 import com.cryptomesh.frontend.notification.AndroidMeshNotifier
@@ -48,6 +50,11 @@ class AppContainer(application: Application) {
             chunkDao = database.mediaChunkDao()
         )
 
+    val groupRepository: GroupRepository =
+        RoomGroupRepository(
+            groupDao = database.groupDao()
+        )
+
     private val mediaFileStore = LocalMediaFileStore(
         application.filesDir.resolve("media_transfers")
     )
@@ -59,6 +66,7 @@ class AppContainer(application: Application) {
             packetRepository = securePacketRepository,
             mediaTransferRepository = mediaTransferRepository,
             mediaFileStore = mediaFileStore,
+            groupRepository = groupRepository,
             transport = AndroidBleTransport(application),
             applicationScope = applicationScope
         )

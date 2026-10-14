@@ -34,6 +34,36 @@ data class DirectAcknowledgementPayload(
     val receivedAtEpochMillis: Long
 )
 
+@Serializable
+data class GroupInvitePayload(
+    val groupId: String,
+    val groupName: String,
+    val groupKeyBase64: String,
+    val creatorDeviceId: String,
+    val members: List<String>,
+    val createdAtEpochMillis: Long
+)
+
+@Serializable
+data class GroupTextPayload(
+    val groupId: String,
+    val groupName: String? = null,
+    val senderDisplayName: String,
+    val text: String,
+    val sentAtEpochMillis: Long,
+    val senderPublicKeyBase64: String? = null
+)
+
+@Serializable
+data class BroadcastTextPayload(
+    val channelId: String,
+    val channelName: String,
+    val senderDisplayName: String,
+    val text: String,
+    val sentAtEpochMillis: Long,
+    val senderPublicKeyBase64: String? = null
+)
+
 class DirectWireCodec {
     private val json = Json {
         encodeDefaults = true
@@ -152,6 +182,30 @@ class DirectWireCodec {
     }
 
     fun decodeMediaComplete(payload: ByteArray): MediaCompletePayload {
+        return json.decodeFromString(payload.decodeToString())
+    }
+
+    fun encodeGroupInvite(payload: GroupInvitePayload): ByteArray {
+        return json.encodeToString(payload).encodeToByteArray()
+    }
+
+    fun decodeGroupInvite(payload: ByteArray): GroupInvitePayload {
+        return json.decodeFromString(payload.decodeToString())
+    }
+
+    fun encodeGroupText(payload: GroupTextPayload): ByteArray {
+        return json.encodeToString(payload).encodeToByteArray()
+    }
+
+    fun decodeGroupText(payload: ByteArray): GroupTextPayload {
+        return json.decodeFromString(payload.decodeToString())
+    }
+
+    fun encodeBroadcastText(payload: BroadcastTextPayload): ByteArray {
+        return json.encodeToString(payload).encodeToByteArray()
+    }
+
+    fun decodeBroadcastText(payload: ByteArray): BroadcastTextPayload {
         return json.decodeFromString(payload.decodeToString())
     }
 

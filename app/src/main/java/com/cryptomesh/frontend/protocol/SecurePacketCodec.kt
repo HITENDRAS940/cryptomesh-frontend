@@ -2,6 +2,7 @@ package com.cryptomesh.frontend.protocol
 
 import com.cryptomesh.frontend.crypto.PacketSignatureService
 import com.cryptomesh.frontend.crypto.SessionCipher
+import com.cryptomesh.frontend.logging.MeshLog
 import java.security.MessageDigest
 import java.security.SecureRandom
 import java.util.Base64
@@ -35,9 +36,13 @@ class SecurePacketCodec(
         require(receiverId.isNotBlank()) { "Receiver ID is required." }
         require(payload.isNotEmpty()) { "Packet payload cannot be empty." }
 
+        val id = packetId()
+        val ttlDesc = expiresAtEpochMillis?.let { "${it - now()}ms" } ?: "none"
+        MeshLog.packet("CREATING PACKET: id=$id, type=$packetType, sender=$senderId -> receiver=$receiverId, payloadSize=${payload.size}B, ttl=$ttlDesc")
+
         val header = PacketHeader(
             protocolVersion = CURRENT_PROTOCOL_VERSION,
-            packetId = packetId(),
+            packetId = id,
             packetType = packetType,
             senderId = senderId,
             receiverId = receiverId,
@@ -55,17 +60,17 @@ class SecurePacketCodec(
         val signatureInput = json.encodeToString(unsignedPacket)
             .encodeToByteArray()
 
-        return unsignedPacket.toEnvelope(
-            signatureBase64 = signatureService
-                .sign(signatureInput)
-                .toBase64()
-        )
+        val signature = signatureService.sign(signatureInput).toBase64()
+        val envelope = unsignedPacket.toEnvelope(signatureBase64 = signature)
+        MeshLog.packet("SEALED PACKET: id=$id, cipherBytes=${encryptedPayload.size}, sig=${signature.take(16)}...")
+        return envelope
     }
 
     fun open(
         envelope: SecurePacketEnvelope,
         senderPublicKeyBytes: ByteArray
     ): Result<ByteArray> = runCatching {
+        MeshLog.packet("OPENING PACKET: id=${envelope.packetId}, type=${envelope.packetType}, from=${envelope.senderId} to=${envelope.receiverId}")
         require(
             envelope.protocolVersion == CURRENT_PROTOCOL_VERSION
         ) {
@@ -87,6 +92,7 @@ class SecurePacketCodec(
             publicKeyBytes = senderPublicKeyBytes
         )
         require(signatureValid) { "Packet signature verification failed." }
+        MeshLog.packet("Signature VERIFIED for packet ${envelope.packetId} from ${envelope.senderId}")
 
         val associatedData = json
             .encodeToString(unsignedPacket.header)
@@ -102,7 +108,28 @@ class SecurePacketCodec(
         ) {
             "Packet payload hash verification failed."
         }
+        MeshLog.packet("PACKET OPENED SUCCESSFULLY: id=${envelope.packetId}, plaintext=${plaintext.size}B")
         plaintext
+    }.onFailure { error ->
+        MeshLog.error("PACKET", "Failed to open packet ${envelope.packetId} from ${envelope.senderId}: ${error.message}", error)
+    }
+
+    fun decryptPayloadWithoutVerification(
+        envelope: SecurePacketEnvelope
+    ): Result<ByteArray> = runCatching {
+        MeshLog.packet("PRE-DECRYPTING group/broadcast packet ${envelope.packetId} (receiver=${envelope.receiverId}) with group key...")
+        val unsignedPacket = envelope.toUnsigned()
+        val associatedData = json
+            .encodeToString(unsignedPacket.header)
+            .encodeToByteArray()
+        val plaintext = sessionCipher.decrypt(
+            ciphertext = envelope.encryptedPayloadBase64.fromBase64(),
+            associatedData = associatedData
+        )
+        MeshLog.packet("Pre-decrypted packet ${envelope.packetId}: plaintext=${plaintext.size}B")
+        plaintext
+    }.onFailure { error ->
+        MeshLog.error("PACKET", "Failed to pre-decrypt packet ${envelope.packetId}: ${error.message}", error)
     }
 
     fun encode(envelope: SecurePacketEnvelope): ByteArray {

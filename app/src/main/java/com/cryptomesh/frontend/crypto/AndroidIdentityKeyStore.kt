@@ -1,7 +1,9 @@
 package com.cryptomesh.frontend.crypto
 
+import android.os.Build
 import android.security.keystore.KeyGenParameterSpec
 import android.security.keystore.KeyProperties
+import androidx.annotation.RequiresApi
 import java.security.KeyFactory
 import java.security.KeyPair
 import java.security.KeyPairGenerator
@@ -11,6 +13,7 @@ import java.security.Signature
 import java.security.spec.ECGenParameterSpec
 import java.security.spec.X509EncodedKeySpec
 
+@RequiresApi(Build.VERSION_CODES.M)
 class AndroidIdentityKeyStore : IdentityKeyStore {
     private val keyStore: KeyStore
         get() = KeyStore.getInstance(ANDROID_KEY_STORE).apply { load(null) }

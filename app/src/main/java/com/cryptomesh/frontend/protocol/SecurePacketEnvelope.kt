@@ -12,7 +12,10 @@ enum class SecurePacketType {
     MediaChunk,
     MediaFragment,
     MediaChunkAcknowledgement,
-    MediaComplete
+    MediaComplete,
+    GroupInvite,
+    GroupMessage,
+    BroadcastMessage
 }
 
 @Serializable

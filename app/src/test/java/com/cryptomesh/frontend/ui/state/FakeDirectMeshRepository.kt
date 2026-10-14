@@ -64,6 +64,45 @@ class FakeDirectMeshRepository(
             ?: Result.success("media-transfer-test")
     }
 
+    val sentGroupMessages = mutableListOf<Pair<String, String>>()
+    val sentBroadcastMessages = mutableListOf<Pair<String, String>>()
+    val createdGroups = mutableListOf<Pair<String, List<String>>>()
+
+    override suspend fun createGroup(
+        name: String,
+        initialMemberDeviceIds: List<String>
+    ): Result<com.cryptomesh.frontend.data.repository.DirectGroup> {
+        createdGroups += name to initialMemberDeviceIds
+        val group = com.cryptomesh.frontend.data.repository.DirectGroup(
+            groupId = "group-${createdGroups.size}",
+            groupName = name,
+            isBroadcastChannel = false,
+            creatorDeviceId = "self",
+            members = initialMemberDeviceIds,
+            createdAtEpochMillis = System.currentTimeMillis(),
+            lastActivityEpochMillis = System.currentTimeMillis()
+        )
+        return Result.success(group)
+    }
+
+    override suspend fun sendGroupText(
+        groupId: String,
+        text: String
+    ): Result<String> {
+        sentGroupMessages += groupId to text
+        return sendFailure?.let(Result.Companion::failure)
+            ?: Result.success("packet-group-test")
+    }
+
+    override suspend fun sendBroadcastText(
+        channelId: String,
+        text: String
+    ): Result<String> {
+        sentBroadcastMessages += channelId to text
+        return sendFailure?.let(Result.Companion::failure)
+            ?: Result.success("packet-broadcast-test")
+    }
+
     override suspend fun retryOutgoingTransfer(transferId: String): Result<Unit> {
         return Result.success(Unit)
     }

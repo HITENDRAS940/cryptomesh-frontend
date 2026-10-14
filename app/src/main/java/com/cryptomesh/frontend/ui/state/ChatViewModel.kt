@@ -116,10 +116,27 @@ class ChatViewModel(
         }
         viewModelScope.launch {
             if (text.isNotEmpty()) {
-                directMeshRepository.sendText(
-                    conversation.deviceId,
-                    text
-                ).onFailure { error ->
+                val result = when {
+                    conversation.isBroadcastChannel -> {
+                        directMeshRepository.sendBroadcastText(
+                            channelId = conversation.deviceId,
+                            text = text
+                        )
+                    }
+                    conversation.isGroup -> {
+                        directMeshRepository.sendGroupText(
+                            groupId = conversation.deviceId,
+                            text = text
+                        )
+                    }
+                    else -> {
+                        directMeshRepository.sendText(
+                            conversation.deviceId,
+                            text
+                        )
+                    }
+                }
+                result.onFailure { error ->
                     showSendError(error, "Message delivery failed.")
                 }
             }
@@ -155,10 +172,15 @@ class ChatViewModel(
             return
         }
         viewModelScope.launch {
-            directMeshRepository.sendText(
-                conversation.deviceId,
-                message.text
-            ).onFailure { error ->
+            val result = when {
+                conversation.isBroadcastChannel ->
+                    directMeshRepository.sendBroadcastText(conversation.deviceId, message.text)
+                conversation.isGroup ->
+                    directMeshRepository.sendGroupText(conversation.deviceId, message.text)
+                else ->
+                    directMeshRepository.sendText(conversation.deviceId, message.text)
+            }
+            result.onFailure { error ->
                 _uiState.update {
                     it.copy(
                         errorMessage = error.message
@@ -203,8 +225,76 @@ class ChatViewModel(
         _uiState.update { it.copy(errorMessage = null) }
     }
 
+    fun openCreateGroupDialog() {
+        val verifiedPeers = _uiState.value.conversations
+            .filter { !it.isGroup && it.isVerifiedSession }
+            .map { PeerOption(it.deviceId, it.peerName) }
+        _uiState.update {
+            it.copy(
+                isCreateGroupDialogOpen = true,
+                availablePeersForGroup = verifiedPeers,
+                errorMessage = null
+            )
+        }
+    }
+
+    fun closeCreateGroupDialog() {
+        _uiState.update { it.copy(isCreateGroupDialogOpen = false) }
+    }
+
+    fun clearGroupSuccessMessage() {
+        _uiState.update { it.copy(groupCreationSuccessMessage = null) }
+    }
+
+    fun createGroup(name: String, selectedMemberDeviceIds: List<String>) {
+        val cleanName = name.trim()
+        if (cleanName.isEmpty()) {
+            _uiState.update { it.copy(errorMessage = "Group name cannot be empty.") }
+            return
+        }
+        viewModelScope.launch {
+            directMeshRepository.createGroup(cleanName, selectedMemberDeviceIds)
+                .onSuccess { group ->
+                    _uiState.update {
+                        it.copy(
+                            isCreateGroupDialogOpen = false,
+                            selectedConversationId = GROUP_CONVERSATION_PREFIX + group.groupId,
+                            groupCreationSuccessMessage = "Group '${group.groupName}' created!"
+                        )
+                    }
+                }
+                .onFailure { error ->
+                    _uiState.update {
+                        it.copy(errorMessage = error.message ?: "Failed to create group.")
+                    }
+                }
+        }
+    }
+
     private fun applyDirectMeshState(meshState: DirectMeshState) {
-        val conversations = meshState.peers
+        val groupConversations = meshState.groups.map { group ->
+            val groupMessages = meshState.messages
+                .filter { it.groupId == group.groupId }
+                .sortedBy(DirectMessage::sentAtEpochMillis)
+                .map(DirectMessage::toUiModel)
+            val latest = groupMessages.lastOrNull()
+            ConversationUiModel(
+                id = GROUP_CONVERSATION_PREFIX + group.groupId,
+                peerName = group.groupName,
+                deviceId = group.groupId,
+                preview = latest?.text ?: if (group.isBroadcastChannel) "Public mesh broadcast" else "${group.members.size} members",
+                timestamp = latest?.timestamp ?: if (group.isBroadcastChannel) "Broadcast" else "Group",
+                isConnected = true,
+                isVerifiedSession = true,
+                messages = groupMessages,
+                mediaTransfers = emptyList(),
+                isGroup = true,
+                isBroadcastChannel = group.isBroadcastChannel,
+                memberCount = group.members.size
+            )
+        }
+
+        val peerConversations = meshState.peers
             .filter { it.deviceId != null }
             .groupBy { requireNotNull(it.deviceId) }
             .values
@@ -217,22 +307,22 @@ class ChatViewModel(
                         .thenBy { it.signalStrength }
                 ) ?: error("A peer group cannot be empty.")
             }
-            .sortedByDescending { peer ->
-                meshState.messages
-                    .filter { it.peerDeviceId == peer.deviceId }
-                    .maxOfOrNull(DirectMessage::sentAtEpochMillis)
-                    ?: 0L
-            }
             .map { peer ->
                 peer.toConversation(
                     directMessages = meshState.messages.filter {
-                        it.peerDeviceId == peer.deviceId
+                        it.groupId == null && it.peerDeviceId == peer.deviceId
                     },
                     mediaTransfers = meshState.mediaTransfers.filter {
                         it.peerDeviceId == peer.deviceId
                     }
                 )
             }
+
+        val conversations = (groupConversations + peerConversations).sortedWith(
+            compareByDescending<ConversationUiModel> { it.isBroadcastChannel }
+                .thenByDescending { it.messages.lastOrNull()?.createdAtEpochMillis ?: 0L }
+        )
+
         _uiState.update { current ->
             current.copy(
                 conversations = conversations,
@@ -248,6 +338,7 @@ class ChatViewModel(
         const val MAX_MESSAGE_LENGTH = 1_000
         private const val MAX_FILE_NAME_LENGTH = 120
         private const val LIVE_CONVERSATION_PREFIX = "live-"
+        private const val GROUP_CONVERSATION_PREFIX = "group-"
 
         fun factory(
             repository: DirectMeshRepository
@@ -343,7 +434,9 @@ private fun DirectMessage.toUiModel(): ChatMessageUiModel {
                     MessageDeliveryStatus.Failed
             }
         },
-        createdAtEpochMillis = sentAtEpochMillis
+        createdAtEpochMillis = sentAtEpochMillis,
+        senderDisplayName = senderDisplayName,
+        senderDeviceId = peerDeviceId
     )
 }
 
