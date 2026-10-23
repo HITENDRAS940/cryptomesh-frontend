@@ -1,6 +1,8 @@
 package com.cryptomesh.frontend.data.repository
 
+import com.cryptomesh.frontend.crypto.DopKeyWrappingService
 import com.cryptomesh.frontend.crypto.PacketSignatureService
+import com.cryptomesh.frontend.crypto.SoftwareKeyWrappingService
 import com.cryptomesh.frontend.logging.MeshLog
 import com.cryptomesh.frontend.protocol.AuthenticatedHandshake
 import com.cryptomesh.frontend.protocol.AuthenticatedSession
@@ -15,6 +17,7 @@ import com.cryptomesh.frontend.protocol.MediaCompletePayload
 import com.cryptomesh.frontend.protocol.MediaKind
 import com.cryptomesh.frontend.crypto.GroupCrypto
 import com.cryptomesh.frontend.data.local.GroupEntity
+import com.cryptomesh.frontend.data.local.InMemoryDopDao
 import com.cryptomesh.frontend.protocol.BroadcastTextPayload
 import com.cryptomesh.frontend.protocol.GroupInvitePayload
 import com.cryptomesh.frontend.protocol.GroupTextPayload
@@ -24,6 +27,16 @@ import com.cryptomesh.frontend.protocol.SecurePacketCodec
 import com.cryptomesh.frontend.protocol.SecurePacketEnvelope
 import com.cryptomesh.frontend.protocol.SecurePacketType
 import com.cryptomesh.frontend.protocol.deviceIdForPublicKey
+import com.cryptomesh.frontend.protocol.dop.DopEvaluationSummary
+import com.cryptomesh.frontend.protocol.dop.DopHandshakeCoordinator
+import com.cryptomesh.frontend.protocol.dop.DopInnerPayload
+import com.cryptomesh.frontend.protocol.dop.DopInnerPayloadKind
+import com.cryptomesh.frontend.protocol.dop.DopMetricsCollector
+import com.cryptomesh.frontend.protocol.dop.DopPreKeyRecord
+import com.cryptomesh.frontend.protocol.dop.DopPreKeyValidator
+import com.cryptomesh.frontend.protocol.dop.DopResponderOutcome
+import com.cryptomesh.frontend.relay.DopCacheIngestOutcome
+import com.cryptomesh.frontend.relay.DopRelayCacheManager
 import com.cryptomesh.frontend.transport.DiscoveredTransportPeer
 import com.cryptomesh.frontend.transport.LocalTransportNode
 import com.cryptomesh.frontend.transport.NearbyTransport
@@ -33,6 +46,7 @@ import com.cryptomesh.frontend.transport.TransportUnavailableReason
 import com.cryptomesh.frontend.ui.state.LocalIdentity
 import java.io.File
 import java.util.Base64
+import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -164,6 +178,24 @@ interface DirectMeshRepository {
     // the offer and forward those encrypted chunks again. Returns failure if
     // the transfer cannot be retried (missing files, not outgoing, etc.).
     suspend fun retryOutgoingTransfer(transferId: String): Result<Unit>
+
+    suspend fun sendDopText(peerDeviceId: String, text: String): Result<String> =
+        sendText(peerDeviceId, text)
+
+    suspend fun getOrPublishOwnPreKeyRecord(
+        forceRotateEpoch: Boolean = false
+    ): Result<DopPreKeyRecord> = Result.failure(
+        UnsupportedOperationException("DOP-Handshake is not configured on this repository.")
+    )
+
+    suspend fun importPeerPreKeyRecord(
+        record: DopPreKeyRecord,
+        sourcePeerDeviceId: String? = null
+    ): Result<DopCacheIngestOutcome> = Result.failure(
+        UnsupportedOperationException("DOP-Handshake is not configured on this repository.")
+    )
+
+    fun getDopEvaluationSummary(): DopEvaluationSummary? = null
 }
 
 class BleDirectMeshRepository(
@@ -180,7 +212,41 @@ class BleDirectMeshRepository(
     private val mediaTransferEngine: MediaTransferEngine =
         MediaTransferEngine(now),
     private val handshake: AuthenticatedHandshake =
-        AuthenticatedHandshake(signatureService, now)
+        AuthenticatedHandshake(signatureService, now),
+    private val dopKeyWrappingService: DopKeyWrappingService =
+        SoftwareKeyWrappingService(),
+    val dopMetricsCollector: DopMetricsCollector =
+        DopMetricsCollector(),
+    val dopPreKeyRepository: DopPreKeyRepository =
+        RoomDopPreKeyRepository(
+            dao = InMemoryDopDao(),
+            signatureService = signatureService,
+            keyWrappingService = dopKeyWrappingService,
+            metrics = dopMetricsCollector,
+            now = now
+        ),
+    val dopPreKeyValidator: DopPreKeyValidator =
+        DopPreKeyValidator(
+            signatureService = signatureService,
+            now = now
+        ),
+    val dopRelayCacheManager: DopRelayCacheManager =
+        DopRelayCacheManager(
+            repository = dopPreKeyRepository,
+            validator = dopPreKeyValidator,
+            metrics = dopMetricsCollector,
+            now = now
+        ),
+    val dopHandshakeCoordinator: DopHandshakeCoordinator =
+        DopHandshakeCoordinator(
+            repository = dopPreKeyRepository,
+            relayCacheManager = dopRelayCacheManager,
+            validator = dopPreKeyValidator,
+            signatureService = signatureService,
+            keyWrappingService = dopKeyWrappingService,
+            metrics = dopMetricsCollector,
+            now = now
+        )
 ) : DirectMeshRepository {
     private val _state = MutableStateFlow(DirectMeshState())
     override val state: StateFlow<DirectMeshState> = _state.asStateFlow()
@@ -212,13 +278,41 @@ class BleDirectMeshRepository(
                         forwardedPacketLinks.clear()
                         transport.close()
                         groupRepository.clearAll()
+                        dopPreKeyRepository.clearAll()
+                        dopKeyWrappingService.clear()
                         _state.value = DirectMeshState()
                     }
                     localIdentity = identity
                     if (identity != null) {
                         groupRepository.initDefaultChannels(identity.deviceId)
+                        runCatching {
+                            dopPreKeyRepository.getOrCreateOwnRecord(identity)
+                        }
+                        val restoredSessions = runCatching {
+                            dopHandshakeCoordinator.restorePersistedSessions()
+                        }.getOrDefault(emptyList())
+                        restoredSessions.forEach { restored ->
+                            rememberSession(restored)
+                            upsertOfflineVerifiedPeer(
+                                peerDeviceId = restored.peerDeviceId,
+                                displayName = restored.peerDisplayName
+                            )
+                        }
                     }
                 }
+        }
+        applicationScope.launch {
+            dopRelayCacheManager.cachedRecords.collect { entries ->
+                val currentLocalId = localIdentity?.deviceId
+                entries.forEach { entry ->
+                    if (!entry.isOwnRecord && entry.record.recipientDeviceId != currentLocalId) {
+                        upsertOfflineVerifiedPeer(
+                            peerDeviceId = entry.record.recipientDeviceId,
+                            displayName = entry.record.recipientDisplayName
+                        )
+                    }
+                }
+            }
         }
         applicationScope.launch {
             packetRepository.packets.collect { packets ->
@@ -287,6 +381,7 @@ class BleDirectMeshRepository(
 
     override fun disconnect(linkId: String) {
         pendingHandshakes.remove(linkId)
+        dopRelayCacheManager.clearLinkSyncState(linkId)
         removeSessionForLink(linkId)
         transport.disconnect(linkId)
         updatePeer(linkId) {
@@ -300,6 +395,58 @@ class BleDirectMeshRepository(
         }
     }
 
+    override suspend fun getOrPublishOwnPreKeyRecord(
+        forceRotateEpoch: Boolean
+    ): Result<DopPreKeyRecord> = runCatching {
+        val identity = localIdentity ?: identityRepository.identity.first().also {
+            localIdentity = it
+        }
+        requireNotNull(identity) {
+            "Local identity is not ready."
+        }
+        dopPreKeyRepository.getOrCreateOwnRecord(
+            identity = identity,
+            forceRotateEpoch = forceRotateEpoch
+        )
+    }
+
+    override suspend fun importPeerPreKeyRecord(
+        record: DopPreKeyRecord,
+        sourcePeerDeviceId: String?
+    ): Result<DopCacheIngestOutcome> = runCatching {
+        val identity = localIdentity ?: identityRepository.identity.first().also {
+            localIdentity = it
+        }
+        val outcome = dopRelayCacheManager.ingestRecord(
+            record = record,
+            localDeviceId = identity?.deviceId,
+            sourcePeerDeviceId = sourcePeerDeviceId
+        )
+        when (outcome) {
+            is DopCacheIngestOutcome.RejectedInvalid -> {
+                error("Rejected invalid DOP pre-key record: ${outcome.reason} (${outcome.detail})")
+            }
+            is DopCacheIngestOutcome.RejectedConflict -> {
+                error("Rejected conflicting DOP pre-key record: ${outcome.reason}")
+            }
+            is DopCacheIngestOutcome.RejectedFloodLimit -> {
+                error("Rejected DOP pre-key record due to flood limit.")
+            }
+            else -> Unit
+        }
+        if (outcome.isAcceptedOrUpdated) {
+            upsertOfflineVerifiedPeer(
+                peerDeviceId = record.recipientDeviceId,
+                displayName = record.recipientDisplayName
+            )
+        }
+        outcome
+    }
+
+    override fun getDopEvaluationSummary(): DopEvaluationSummary {
+        return dopMetricsCollector.snapshot()
+    }
+
     override suspend fun sendMedia(
         peerDeviceId: String,
         mediaKind: MediaKind,
@@ -310,7 +457,7 @@ class BleDirectMeshRepository(
         val identity = requireNotNull(localIdentity) {
             "Local identity is not ready."
         }
-        requireVerifiedPeer(peerDeviceId)
+        ensureVerifiedOrCachedDopPeer(peerDeviceId, identity.deviceId)
 
         // Prepare the transfer synchronously but perform network sending async
         val prepared = mediaTransferEngine.prepareOutgoingTransfer(
@@ -393,14 +540,19 @@ class BleDirectMeshRepository(
             "Local identity is not ready."
         }
         MeshLog.transfer("Initiating sendText to peerDeviceId=$peerDeviceId: \"$cleanText\"")
-        val peer = _state.value.peers.firstOrNull {
-            it.deviceId == peerDeviceId && it.isVerified
-        } ?: error("Peer has not been authenticated.")
-        val session = requireNotNull(currentSessionFor(peerDeviceId)) {
-            "Authenticated peer session key is not ready."
+        ensureVerifiedOrCachedDopPeer(peerDeviceId, identity.deviceId)
+
+        val existingSession = currentSessionFor(peerDeviceId)
+        if (existingSession == null) {
+            return@runCatching sendDopTextInternal(
+                identity = identity,
+                peerDeviceId = peerDeviceId,
+                cleanText = cleanText
+            )
         }
+
         val codec = SecurePacketCodec(
-            sessionCipher = session.cipher,
+            sessionCipher = existingSession.cipher,
             signatureService = signatureService,
             now = now
         )
@@ -464,6 +616,91 @@ class BleDirectMeshRepository(
         }
     }
 
+    override suspend fun sendDopText(
+        peerDeviceId: String,
+        text: String
+    ): Result<String> = runCatching {
+        val cleanText = text.trim()
+        require(cleanText.isNotEmpty()) { "Message cannot be empty." }
+        require(cleanText.length <= MAX_TEXT_LENGTH) {
+            "Message exceeds $MAX_TEXT_LENGTH characters."
+        }
+        val identity = requireNotNull(localIdentity) {
+            "Local identity is not ready."
+        }
+        ensureVerifiedOrCachedDopPeer(peerDeviceId, identity.deviceId)
+        sendDopTextInternal(
+            identity = identity,
+            peerDeviceId = peerDeviceId,
+            cleanText = cleanText
+        )
+    }
+
+    private suspend fun sendDopTextInternal(
+        identity: LocalIdentity,
+        peerDeviceId: String,
+        cleanText: String
+    ): String {
+        val sentAt = now()
+        val packetId = UUID.randomUUID().toString()
+        val innerPlaintext = wireCodec.encodeTextPayload(
+            DirectTextPayload(
+                text = cleanText,
+                sentAtEpochMillis = sentAt
+            )
+        )
+        val initiation = dopHandshakeCoordinator.createInitiationForOfflineRecipient(
+            localIdentity = identity,
+            recipientDeviceId = peerDeviceId,
+            packetId = packetId,
+            innerKind = DopInnerPayloadKind.TEXT_MESSAGE,
+            innerPlaintextBytes = innerPlaintext,
+            sentAtEpochMillis = sentAt
+        ).getOrThrow()
+
+        rememberSession(initiation.session)
+        val envelope = SecurePacketCodec.sealDopInitiation(
+            packetId = packetId,
+            senderId = identity.deviceId,
+            receiverId = peerDeviceId,
+            initiationWireBytes = initiation.encodedWireBytes,
+            signatureService = signatureService,
+            now = now,
+            expiresAtEpochMillis = sentAt + MESSAGE_TTL_MILLIS
+        )
+        MeshLog.packet(
+            "DOP initiation text sealed: packetId=${envelope.packetId}, sessionId=${initiation.sessionId}, " +
+                "wireBytes=${initiation.encodedWireBytes.size}, queuing for offline store-carry-forward..."
+        )
+        packetRepository.storeIfAbsent(
+            envelope = envelope,
+            status = PersistedPacketStatus.Queued,
+            ownership = PacketOwnership.Own
+        )
+        upsertMessage(
+            DirectMessage(
+                packetId = envelope.packetId,
+                peerDeviceId = peerDeviceId,
+                text = cleanText,
+                sentAtEpochMillis = sentAt,
+                isOutgoing = true,
+                status = DirectMessageStatus.Queued
+            )
+        )
+        val forwarded = forwardEnvelopeToMesh(envelope)
+        if (forwarded) {
+            packetRepository.updateStatus(
+                envelope.packetId,
+                PersistedPacketStatus.AwaitingAcknowledgement
+            )
+            updateMessageStatus(
+                envelope.packetId,
+                DirectMessageStatus.AwaitingAcknowledgement
+            )
+        }
+        return envelope.packetId
+    }
+
     override suspend fun createGroup(
         name: String,
         memberDeviceIds: List<String>
@@ -486,12 +723,6 @@ class BleDirectMeshRepository(
 
     private suspend fun sendGroupInvite(group: GroupEntity, recipientDeviceId: String) {
         val identity = localIdentity ?: return
-        val session = currentSessionFor(recipientDeviceId) ?: run {
-            MeshLog.warn("TRANSFER", "Cannot send group invite to $recipientDeviceId: no active session.")
-            return
-        }
-        MeshLog.transfer("Sending group invite for '${group.groupName}' (${group.groupId}) to recipient $recipientDeviceId")
-        val codec = SecurePacketCodec(session.cipher, signatureService, now)
         val sentAt = now()
         val payload = wireCodec.encodeGroupInvite(
             GroupInvitePayload(
@@ -503,13 +734,41 @@ class BleDirectMeshRepository(
                 createdAtEpochMillis = sentAt
             )
         )
-        val envelope = codec.seal(
-            packetType = SecurePacketType.GroupInvite,
-            senderId = identity.deviceId,
-            receiverId = recipientDeviceId,
-            payload = payload,
-            expiresAtEpochMillis = sentAt + MESSAGE_TTL_MILLIS
-        )
+        val session = currentSessionFor(recipientDeviceId)
+        val envelope = if (session != null) {
+            MeshLog.transfer("Sending group invite for '${group.groupName}' (${group.groupId}) to recipient $recipientDeviceId")
+            val codec = SecurePacketCodec(session.cipher, signatureService, now)
+            codec.seal(
+                packetType = SecurePacketType.GroupInvite,
+                senderId = identity.deviceId,
+                receiverId = recipientDeviceId,
+                payload = payload,
+                expiresAtEpochMillis = sentAt + MESSAGE_TTL_MILLIS
+            )
+        } else {
+            val packetId = UUID.randomUUID().toString()
+            val initiation = dopHandshakeCoordinator.createInitiationForOfflineRecipient(
+                localIdentity = identity,
+                recipientDeviceId = recipientDeviceId,
+                packetId = packetId,
+                innerKind = DopInnerPayloadKind.GROUP_INVITE,
+                innerPlaintextBytes = payload,
+                sentAtEpochMillis = sentAt
+            ).getOrElse {
+                MeshLog.warn("TRANSFER", "Cannot send group invite to $recipientDeviceId: no active session or DOP pre-key record.")
+                return
+            }
+            rememberSession(initiation.session)
+            SecurePacketCodec.sealDopInitiation(
+                packetId = packetId,
+                senderId = identity.deviceId,
+                receiverId = recipientDeviceId,
+                initiationWireBytes = initiation.encodedWireBytes,
+                signatureService = signatureService,
+                now = now,
+                expiresAtEpochMillis = sentAt + MESSAGE_TTL_MILLIS
+            )
+        }
         MeshLog.packet("Group invite sealed: packetId=${envelope.packetId}, forwarding to mesh...")
         packetRepository.storeIfAbsent(
             envelope = envelope,
@@ -714,12 +973,23 @@ class BleDirectMeshRepository(
 
     private fun addDiscoveredPeer(peer: DiscoveredTransportPeer) {
         _state.update { state ->
-            val current = state.peers.firstOrNull {
+            val currentByLink = state.peers.firstOrNull {
                 it.linkId == peer.linkId
             }
-            val updated = current?.copy(
+            val currentByDopDevice = if (currentByLink == null && peer.advertisedDeviceId != null) {
+                state.peers.firstOrNull {
+                    it.linkId.startsWith(DOP_LINK_PREFIX) &&
+                        (it.deviceId == peer.advertisedDeviceId ||
+                            it.advertisedDeviceId == peer.advertisedDeviceId)
+                }
+            } else {
+                null
+            }
+            val base = currentByLink ?: currentByDopDevice
+            val updated = base?.copy(
+                linkId = peer.linkId,
                 advertisedDeviceId = peer.advertisedDeviceId
-                    ?: current.advertisedDeviceId,
+                    ?: base.advertisedDeviceId,
                 signalStrength = peer.signalStrength
             ) ?: DirectPeer(
                 linkId = peer.linkId,
@@ -731,7 +1001,10 @@ class BleDirectMeshRepository(
             )
             state.copy(
                 peers = state.peers
-                    .filterNot { it.linkId == peer.linkId } + updated
+                    .filterNot {
+                        it.linkId == peer.linkId ||
+                            (currentByDopDevice != null && it.linkId == currentByDopDevice.linkId)
+                    } + updated
             )
         }
     }
@@ -758,6 +1031,7 @@ class BleDirectMeshRepository(
             TransportLinkStatus.Disconnected -> {
                 MeshLog.ble("Link ${event.linkId} disconnected. Clearing sessions.")
                 pendingHandshakes.remove(event.linkId)
+                dopRelayCacheManager.clearLinkSyncState(event.linkId)
                 removeSessionForLink(event.linkId)
                 updatePeer(event.linkId) {
                     it.copy(
@@ -774,6 +1048,7 @@ class BleDirectMeshRepository(
             TransportLinkStatus.Failed -> {
                 MeshLog.warn("BLE", "Link ${event.linkId} failed: ${event.message}")
                 pendingHandshakes.remove(event.linkId)
+                dopRelayCacheManager.clearLinkSyncState(event.linkId)
                 removeSessionForLink(event.linkId)
                 ensurePeer(event.linkId)
                 updatePeer(event.linkId) {
@@ -839,6 +1114,11 @@ class BleDirectMeshRepository(
                     MeshLog.packet("Wire message decoded as SecurePacket from linkId=$linkId (packetId=${decoded.envelope.packetId}, type=${decoded.envelope.packetType})")
                     handleSecurePacket(linkId, decoded)
                 }
+
+                is DecodedDirectWireMessage.DopPreKeySync -> {
+                    MeshLog.auth("Wire message decoded as DopPreKeySync from linkId=$linkId")
+                    handleDopPreKeySync(linkId, decoded)
+                }
             }
         }.onFailure {
             MeshLog.error("TRANSFER", "Failed to decode wire payload from linkId=$linkId: ${it.message}")
@@ -859,6 +1139,7 @@ class BleDirectMeshRepository(
         }
         val identity = localIdentity ?: return
         ensurePeer(linkId)
+        val startNanos = System.nanoTime()
         MeshLog.auth("Processing peer HandshakeHello on linkId=$linkId from peerDisplayName='${message.hello.displayName}' (device=${message.hello.deviceId.take(8)}...)")
         val pending = pendingHandshakes[linkId] ?: run {
             val created = handshake.createHello(identity)
@@ -886,20 +1167,36 @@ class BleDirectMeshRepository(
             remoteHello = message.hello,
             expectedDeviceId = discoveredDeviceId
         ).onSuccess { session ->
+            val durationNanos = System.nanoTime() - startNanos
+            val helloBytes = wireCodec.encodeHandshake(message.hello).size
+            dopMetricsCollector.recordDirectHandshake(durationNanos, helloBytes)
+
             MeshLog.auth("Mutual authentication SUCCEEDED for linkId=$linkId! Peer verified: deviceId=${session.peerDeviceId}, name='${session.peerDisplayName}'")
             sessions[linkId] = session
             rememberSession(session)
             pendingHandshakes.remove(linkId)
-            updatePeer(linkId) {
-                it.copy(
-                    deviceId = session.peerDeviceId,
-                    displayName = session.peerDisplayName,
-                    status = DirectPeerStatus.Connected,
-                    isVerified = true,
-                    failureMessage = null
+            _state.update { state ->
+                val withoutSyntheticDop = state.peers.filterNot {
+                    it.linkId == "$DOP_LINK_PREFIX${session.peerDeviceId}" && it.linkId != linkId
+                }
+                state.copy(
+                    peers = withoutSyntheticDop.map {
+                        if (it.linkId == linkId) {
+                            it.copy(
+                                deviceId = session.peerDeviceId,
+                                displayName = session.peerDisplayName,
+                                status = DirectPeerStatus.Connected,
+                                isVerified = true,
+                                failureMessage = null
+                            )
+                        } else {
+                            it
+                        }
+                    }
                 )
             }
             applicationScope.launch {
+                syncDopPreKeysWithPeer(linkId, session.peerDeviceId)
                 flushPacketsForLink(linkId)
             }
         }.onFailure {
@@ -909,6 +1206,63 @@ class BleDirectMeshRepository(
                 it.message ?: "Peer authentication failed."
             )
             transport.disconnect(linkId)
+        }
+    }
+
+    private suspend fun syncDopPreKeysWithPeer(
+        linkId: String,
+        peerDeviceId: String
+    ) {
+        val identity = localIdentity ?: return
+        if (!sessions.containsKey(linkId)) return
+        runCatching {
+            val syncMessage = dopRelayCacheManager.buildSyncMessageForPeer(
+                localIdentity = identity,
+                targetPeerDeviceId = peerDeviceId,
+                linkId = linkId
+            )
+            val wireBytes = wireCodec.encodeDopPreKeySync(syncMessage)
+            transport.send(linkId, wireBytes)
+        }.onFailure {
+            MeshLog.warn("DOP-SYNC", "Failed to send DopPreKeySync on linkId=$linkId: ${it.message}")
+        }
+    }
+
+    private suspend fun handleDopPreKeySync(
+        linkId: String,
+        message: DecodedDirectWireMessage.DopPreKeySync
+    ) {
+        val identity = localIdentity ?: return
+        val linkSession = sessions[linkId] ?: run {
+            MeshLog.warn("DOP-SYNC", "Rejected DopPreKeySync on unauthenticated linkId=$linkId")
+            return
+        }
+        val ingestion = dopRelayCacheManager.processIncomingSyncMessage(
+            localIdentity = identity,
+            sourcePeerDeviceId = linkSession.peerDeviceId,
+            linkId = linkId,
+            syncMessage = message.syncMessage
+        )
+        ingestion.newlyAcceptedRecords.forEach { record ->
+            upsertOfflineVerifiedPeer(
+                peerDeviceId = record.recipientDeviceId,
+                displayName = record.recipientDisplayName
+            )
+        }
+        val followUp = ingestion.followUpSyncToReply
+        if (followUp != null && sessions.containsKey(linkId)) {
+            runCatching {
+                transport.send(linkId, wireCodec.encodeDopPreKeySync(followUp))
+            }
+        }
+        if (ingestion.newlyAcceptedRecords.isNotEmpty()) {
+            // Propagate newly learned records to any other currently connected links
+            val otherLinks = sessions.entries.filter { (otherLinkId, _) ->
+                otherLinkId != linkId
+            }
+            for ((otherLinkId, otherSession) in otherLinks) {
+                syncDopPreKeysWithPeer(otherLinkId, otherSession.peerDeviceId)
+            }
         }
     }
 
@@ -955,6 +1309,11 @@ class BleDirectMeshRepository(
             receiveRelayPacket(linkId, envelope, identity.deviceId)
             return
         }
+        if (envelope.packetType == SecurePacketType.DopInitiation) {
+            MeshLog.auth("SecurePacket id=${envelope.packetId} is a DOP-Handshake initiation directed to this device.")
+            receiveDopInitiation(linkId, envelope, identity)
+            return
+        }
         MeshLog.packet("SecurePacket id=${envelope.packetId} is directed to this device. Opening payload with peer session...")
         val plaintext = openWithKnownPeerSession(envelope) ?: run {
             MeshLog.warn("PACKET", "Unable to decrypt packet id=${envelope.packetId} with known sessions. Storing for relay queue.")
@@ -965,6 +1324,14 @@ class BleDirectMeshRepository(
             )
             return
         }
+        dispatchDecryptedUnicastPacket(linkId, envelope, plaintext)
+    }
+
+    private suspend fun dispatchDecryptedUnicastPacket(
+        linkId: String?,
+        envelope: SecurePacketEnvelope,
+        plaintext: ByteArray
+    ) {
         MeshLog.packet("SecurePacket id=${envelope.packetId} decrypted successfully (${plaintext.size} bytes)! Dispatching type=${envelope.packetType}...")
         runCatching {
             when (envelope.packetType) {
@@ -980,8 +1347,10 @@ class BleDirectMeshRepository(
 
                 SecurePacketType.BroadcastMessage -> Unit
 
+                SecurePacketType.DopInitiation -> Unit
+
                 SecurePacketType.Acknowledgement -> {
-                    receiveAcknowledgement(plaintext)
+                    receiveAcknowledgement(envelope, plaintext)
                 }
 
                 SecurePacketType.MediaOffer -> {
@@ -1012,12 +1381,252 @@ class BleDirectMeshRepository(
             }
         }.onFailure {
             MeshLog.error("PACKET", "Failed to process decrypted packet ${envelope.packetId}: ${it.message}", it)
-            updatePeer(linkId) { peer ->
-                peer.copy(
-                    failureMessage = it.message
-                        ?: "Secure packet verification failed."
+            if (linkId != null) {
+                updatePeer(linkId) { peer ->
+                    peer.copy(
+                        failureMessage = it.message
+                            ?: "Secure packet verification failed."
+                    )
+                }
+            }
+        }
+    }
+
+    private suspend fun receiveDopInitiation(
+        linkId: String,
+        envelope: SecurePacketEnvelope,
+        identity: LocalIdentity
+    ) {
+        val rawWireBytes = runCatching {
+            envelope.encryptedPayloadBase64.fromBase64()
+        }.getOrNull() ?: return
+
+        val previewWire = runCatching {
+            com.cryptomesh.frontend.protocol.dop.DopHandshakeMessageCodec
+                .decodeInitiationWirePayload(rawWireBytes)
+        }.getOrNull() ?: return
+
+        val senderSigningPubBytes = runCatching {
+            previewWire.senderSigningPublicKeyBase64.fromBase64()
+        }.getOrNull() ?: return
+
+        if (deviceIdForPublicKey(senderSigningPubBytes) != envelope.senderId) {
+            MeshLog.warn("DOP", "Rejected DopInitiation ${envelope.packetId}: outer senderId does not match signing key.")
+            return
+        }
+
+        val verifiedWireBytes = SecurePacketCodec.openDopInitiationOuter(
+            envelope = envelope,
+            senderPublicKeyBytes = senderSigningPubBytes,
+            signatureService = signatureService,
+            now = now
+        ).getOrElse { error ->
+            MeshLog.warn("DOP", "Outer DopInitiation envelope verification failed for ${envelope.packetId}: ${error.message}")
+            return
+        }
+
+        val linkPeerId = sessions[linkId]?.peerDeviceId
+        val hopCount = if (linkPeerId != null && linkPeerId != envelope.senderId) 2 else 1
+
+        when (
+            val outcome = dopHandshakeCoordinator.processIncomingInitiation(
+                localIdentity = identity,
+                packetId = envelope.packetId,
+                outerSenderId = envelope.senderId,
+                outerReceiverId = envelope.receiverId,
+                initiationWireBytes = verifiedWireBytes,
+                hopCount = hopCount
+            )
+        ) {
+            is DopResponderOutcome.Accepted -> {
+                rememberSession(outcome.session)
+                upsertOfflineVerifiedPeer(
+                    peerDeviceId = outcome.session.peerDeviceId,
+                    displayName = outcome.session.peerDisplayName
+                )
+                dispatchDopInnerPayload(
+                    envelope = envelope,
+                    innerPayload = outcome.innerPayload,
+                    dopSessionId = outcome.sessionId,
+                    dopConfirmationTagBase64 = outcome.confirmationTagBase64
+                )
+                reprocessQueuedPacketsForSender(outcome.session.peerDeviceId)
+            }
+
+            is DopResponderOutcome.DuplicateInitiationCoalesced -> {
+                rememberSession(outcome.session)
+                upsertOfflineVerifiedPeer(
+                    peerDeviceId = outcome.session.peerDeviceId,
+                    displayName = outcome.session.peerDisplayName
+                )
+                sendAcknowledgement(
+                    receiverDeviceId = envelope.senderId,
+                    acknowledgedPacketId = outcome.originalPacketId,
+                    dopSessionId = outcome.sessionId,
+                    dopConfirmationTagBase64 = outcome.confirmationTagBase64
                 )
             }
+
+            is DopResponderOutcome.Rejected -> {
+                MeshLog.warn(
+                    "DOP",
+                    "Rejected DOP initiation packet ${envelope.packetId} from ${envelope.senderId}: " +
+                        "${outcome.reason} (${outcome.detail})"
+                )
+            }
+        }
+    }
+
+    private suspend fun dispatchDopInnerPayload(
+        envelope: SecurePacketEnvelope,
+        innerPayload: DopInnerPayload,
+        dopSessionId: String,
+        dopConfirmationTagBase64: String
+    ) {
+        val innerPlaintext = innerPayload.payloadBase64.fromBase64()
+        when (innerPayload.kind) {
+            DopInnerPayloadKind.TEXT_MESSAGE -> {
+                val text = wireCodec.decodeTextPayload(innerPlaintext)
+                val inserted = packetRepository.storeIfAbsent(
+                    envelope = envelope,
+                    status = PersistedPacketStatus.Acknowledged,
+                    ownership = PacketOwnership.Own
+                )
+                if (inserted) {
+                    upsertMessage(
+                        DirectMessage(
+                            packetId = envelope.packetId,
+                            peerDeviceId = envelope.senderId,
+                            text = text.text,
+                            sentAtEpochMillis = text.sentAtEpochMillis,
+                            isOutgoing = false,
+                            status = DirectMessageStatus.Acknowledged
+                        )
+                    )
+                }
+                sendAcknowledgement(
+                    receiverDeviceId = envelope.senderId,
+                    acknowledgedPacketId = envelope.packetId,
+                    dopSessionId = dopSessionId,
+                    dopConfirmationTagBase64 = dopConfirmationTagBase64
+                )
+            }
+
+            DopInnerPayloadKind.MEDIA_OFFER -> {
+                packetRepository.storeIfAbsent(
+                    envelope = envelope,
+                    status = PersistedPacketStatus.Acknowledged,
+                    ownership = PacketOwnership.Own
+                )
+                receiveMediaOffer(envelope, innerPlaintext)
+                sendAcknowledgement(
+                    receiverDeviceId = envelope.senderId,
+                    acknowledgedPacketId = envelope.packetId,
+                    dopSessionId = dopSessionId,
+                    dopConfirmationTagBase64 = dopConfirmationTagBase64
+                )
+            }
+
+            DopInnerPayloadKind.GROUP_INVITE -> {
+                val invite = wireCodec.decodeGroupInvite(innerPlaintext)
+                val inserted = packetRepository.storeIfAbsent(
+                    envelope = envelope,
+                    status = PersistedPacketStatus.Acknowledged,
+                    ownership = PacketOwnership.Own
+                )
+                if (inserted) {
+                    groupRepository.joinGroup(
+                        GroupEntity(
+                            groupId = invite.groupId,
+                            groupName = invite.groupName,
+                            isBroadcastChannel = false,
+                            creatorDeviceId = invite.creatorDeviceId,
+                            groupKeyBase64 = invite.groupKeyBase64,
+                            membersCsv = invite.members.joinToString(","),
+                            createdAtEpochMillis = invite.createdAtEpochMillis,
+                            lastActivityEpochMillis = now()
+                        )
+                    )
+                }
+                sendAcknowledgement(
+                    receiverDeviceId = envelope.senderId,
+                    acknowledgedPacketId = envelope.packetId,
+                    dopSessionId = dopSessionId,
+                    dopConfirmationTagBase64 = dopConfirmationTagBase64
+                )
+            }
+
+            DopInnerPayloadKind.MEDIA_CHUNK -> {
+                packetRepository.storeIfAbsent(
+                    envelope = envelope,
+                    status = PersistedPacketStatus.Acknowledged,
+                    ownership = PacketOwnership.Own
+                )
+                receiveMediaChunk(envelope, innerPlaintext)
+            }
+
+            DopInnerPayloadKind.MEDIA_FRAGMENT -> {
+                packetRepository.storeIfAbsent(
+                    envelope = envelope,
+                    status = PersistedPacketStatus.Acknowledged,
+                    ownership = PacketOwnership.Own
+                )
+                receiveMediaFragment(envelope, innerPlaintext)
+            }
+
+            DopInnerPayloadKind.MEDIA_ACCEPT -> Unit
+
+            DopInnerPayloadKind.MEDIA_REJECT -> {
+                receiveMediaRejected(innerPlaintext)
+            }
+
+            DopInnerPayloadKind.MEDIA_CHUNK_ACK -> {
+                receiveMediaChunkAcknowledgement(innerPlaintext)
+            }
+
+            DopInnerPayloadKind.MEDIA_COMPLETE -> {
+                receiveMediaComplete(innerPlaintext)
+            }
+
+            DopInnerPayloadKind.SESSION_BOOTSTRAP -> {
+                packetRepository.storeIfAbsent(
+                    envelope = envelope,
+                    status = PersistedPacketStatus.Acknowledged,
+                    ownership = PacketOwnership.Own
+                )
+                sendAcknowledgement(
+                    receiverDeviceId = envelope.senderId,
+                    acknowledgedPacketId = envelope.packetId,
+                    dopSessionId = dopSessionId,
+                    dopConfirmationTagBase64 = dopConfirmationTagBase64
+                )
+            }
+        }
+    }
+
+    private suspend fun reprocessQueuedPacketsForSender(senderDeviceId: String) {
+        val localId = localIdentity?.deviceId ?: return
+        val queuedFromSender = cachedPackets
+            .filter {
+                it.status == PersistedPacketStatus.Queued &&
+                    it.envelope.receiverId == localId &&
+                    it.envelope.senderId == senderDeviceId &&
+                    it.envelope.packetType != SecurePacketType.DopInitiation &&
+                    !isExpired(it.envelope)
+            }
+            .sortedBy { it.envelope.createdAtEpochMillis }
+
+        for (stored in queuedFromSender) {
+            val plaintext = openWithKnownPeerSession(stored.envelope) ?: continue
+            packetRepository.updateStatus(
+                stored.envelope.packetId,
+                PersistedPacketStatus.Acknowledged
+            )
+            dispatchDecryptedUnicastPacket(
+                linkId = null,
+                envelope = stored.envelope,
+                plaintext = plaintext
+            )
         }
     }
 
@@ -1499,7 +2108,9 @@ class BleDirectMeshRepository(
 
     private suspend fun sendAcknowledgement(
         receiverDeviceId: String,
-        acknowledgedPacketId: String
+        acknowledgedPacketId: String,
+        dopSessionId: String? = null,
+        dopConfirmationTagBase64: String? = null
     ) {
         val identity = localIdentity ?: return
         val session = currentSessionFor(receiverDeviceId) ?: run {
@@ -1518,7 +2129,9 @@ class BleDirectMeshRepository(
             payload = wireCodec.encodeAcknowledgement(
                 DirectAcknowledgementPayload(
                     acknowledgedPacketId = acknowledgedPacketId,
-                    receivedAtEpochMillis = sentAt
+                    receivedAtEpochMillis = sentAt,
+                    dopSessionId = dopSessionId,
+                    dopConfirmationTagBase64 = dopConfirmationTagBase64
                 )
             ),
             expiresAtEpochMillis = sentAt + ACK_TTL_MILLIS
@@ -1532,8 +2145,37 @@ class BleDirectMeshRepository(
         forwardEnvelopeToMesh(envelope)
     }
 
-    private suspend fun receiveAcknowledgement(plaintext: ByteArray) {
+    private suspend fun receiveAcknowledgement(
+        envelope: SecurePacketEnvelope,
+        plaintext: ByteArray
+    ) {
         val acknowledgement = wireCodec.decodeAcknowledgement(plaintext)
+        if (
+            acknowledgement.dopSessionId != null ||
+            acknowledgement.dopConfirmationTagBase64 != null
+        ) {
+            val confirmed = dopHandshakeCoordinator.confirmSessionFromAcknowledgement(
+                initiationPacketId = acknowledgement.acknowledgedPacketId,
+                responderDeviceId = envelope.senderId,
+                dopSessionId = acknowledgement.dopSessionId,
+                dopConfirmationTagBase64 = acknowledgement.dopConfirmationTagBase64
+            )
+            if (!confirmed) {
+                MeshLog.warn(
+                    "DOP",
+                    "Rejected DOP acknowledgement for packetId=${acknowledgement.acknowledgedPacketId} " +
+                        "from ${envelope.senderId}: confirmation tag verification failed."
+                )
+                return
+            }
+        } else {
+            dopHandshakeCoordinator.confirmSessionFromAcknowledgement(
+                initiationPacketId = acknowledgement.acknowledgedPacketId,
+                responderDeviceId = envelope.senderId,
+                dopSessionId = null,
+                dopConfirmationTagBase64 = null
+            )
+        }
         MeshLog.transfer("Delivery ACK RECEIVED for packetId=${acknowledgement.acknowledgedPacketId} (status -> Acknowledged)!")
         packetRepository.updateStatus(
             acknowledgement.acknowledgedPacketId,
@@ -1545,10 +2187,37 @@ class BleDirectMeshRepository(
         )
     }
 
-    private fun requireVerifiedPeer(peerDeviceId: String): DirectPeer {
-        return _state.value.peers.firstOrNull {
+    private suspend fun ensureVerifiedOrCachedDopPeer(
+        peerDeviceId: String,
+        localDeviceId: String
+    ): DirectPeer {
+        val existingVerified = _state.value.peers.firstOrNull {
             it.deviceId == peerDeviceId && it.isVerified
-        } ?: error("Peer has not been authenticated.")
+        }
+        if (existingVerified != null) return existingVerified
+
+        val cachedEntry = dopRelayCacheManager.getVerifiedRecordForRecipient(
+            recipientDeviceId = peerDeviceId,
+            localDeviceId = localDeviceId
+        )
+        if (cachedEntry != null) {
+            upsertOfflineVerifiedPeer(
+                peerDeviceId = cachedEntry.record.recipientDeviceId,
+                displayName = cachedEntry.record.recipientDisplayName
+            )
+            return _state.value.peers.firstOrNull {
+                it.deviceId == peerDeviceId && it.isVerified
+            } ?: DirectPeer(
+                linkId = "$DOP_LINK_PREFIX$peerDeviceId",
+                advertisedDeviceId = peerDeviceId,
+                deviceId = peerDeviceId,
+                displayName = cachedEntry.record.recipientDisplayName,
+                signalStrength = UNKNOWN_SIGNAL_STRENGTH,
+                status = DirectPeerStatus.Discovered,
+                isVerified = true
+            )
+        }
+        error("Peer has not been authenticated.")
     }
 
     private suspend fun sealAndForwardMediaPacket(
@@ -1559,20 +2228,45 @@ class BleDirectMeshRepository(
         expiresAtEpochMillis: Long
     ): String {
         MeshLog.transfer("Sealing media packet: type=$packetType, sender=${senderId.take(8)}..., receiver=${receiverId.take(8)}...")
-        val session = requireNotNull(currentSessionFor(receiverId)) {
-            "Authenticated peer session key is not ready."
+        val existingSession = currentSessionFor(receiverId)
+        val envelope = if (existingSession != null) {
+            SecurePacketCodec(
+                sessionCipher = existingSession.cipher,
+                signatureService = signatureService,
+                now = now
+            ).seal(
+                packetType = packetType,
+                senderId = senderId,
+                receiverId = receiverId,
+                payload = payload,
+                expiresAtEpochMillis = expiresAtEpochMillis
+            )
+        } else if (packetType == SecurePacketType.MediaOffer) {
+            val identity = requireNotNull(localIdentity) {
+                "Local identity is not ready."
+            }
+            val packetId = UUID.randomUUID().toString()
+            val initiation = dopHandshakeCoordinator.createInitiationForOfflineRecipient(
+                localIdentity = identity,
+                recipientDeviceId = receiverId,
+                packetId = packetId,
+                innerKind = DopInnerPayloadKind.MEDIA_OFFER,
+                innerPlaintextBytes = payload,
+                sentAtEpochMillis = now()
+            ).getOrThrow()
+            rememberSession(initiation.session)
+            SecurePacketCodec.sealDopInitiation(
+                packetId = packetId,
+                senderId = senderId,
+                receiverId = receiverId,
+                initiationWireBytes = initiation.encodedWireBytes,
+                signatureService = signatureService,
+                now = now,
+                expiresAtEpochMillis = expiresAtEpochMillis
+            )
+        } else {
+            error("Authenticated peer session key is not ready.")
         }
-        val envelope = SecurePacketCodec(
-            sessionCipher = session.cipher,
-            signatureService = signatureService,
-            now = now
-        ).seal(
-            packetType = packetType,
-            senderId = senderId,
-            receiverId = receiverId,
-            payload = payload,
-            expiresAtEpochMillis = expiresAtEpochMillis
-        )
         MeshLog.packet("Media packet sealed: id=${envelope.packetId}, payloadCipherChars=${envelope.encryptedPayloadBase64.length}, forwarding to mesh...")
         packetRepository.storeIfAbsent(
             envelope = envelope,
@@ -1956,6 +2650,11 @@ class BleDirectMeshRepository(
                 candidateLinksFor(envelope, incomingLinkId = null)
                     .contains(linkId)
             }
+            .sortedWith(
+                compareBy<SecurePacketEnvelope> {
+                    if (it.packetType == SecurePacketType.DopInitiation) 0 else 1
+                }.thenBy { it.createdAtEpochMillis }
+            )
         if (forwardable.isNotEmpty()) {
             MeshLog.transfer("Flushing ${forwardable.size} queued packets for newly authenticated linkId=$linkId...")
         }
@@ -2140,12 +2839,56 @@ class BleDirectMeshRepository(
         }
     }
 
+    private fun upsertOfflineVerifiedPeer(
+        peerDeviceId: String,
+        displayName: String
+    ) {
+        if (peerDeviceId == localIdentity?.deviceId) return
+        _state.update { state ->
+            val existingByDevice = state.peers.firstOrNull {
+                it.deviceId == peerDeviceId || it.advertisedDeviceId == peerDeviceId
+            }
+            if (existingByDevice != null) {
+                state.copy(
+                    peers = state.peers.map { peer ->
+                        if (peer.linkId == existingByDevice.linkId) {
+                            peer.copy(
+                                deviceId = peerDeviceId,
+                                displayName = if (peer.displayName == "CryptoMesh peer" || peer.displayName.startsWith("Peer ")) {
+                                    displayName
+                                } else {
+                                    peer.displayName
+                                },
+                                isVerified = true
+                            )
+                        } else {
+                            peer
+                        }
+                    }
+                )
+            } else {
+                state.copy(
+                    peers = state.peers + DirectPeer(
+                        linkId = "$DOP_LINK_PREFIX$peerDeviceId",
+                        advertisedDeviceId = peerDeviceId,
+                        deviceId = peerDeviceId,
+                        displayName = displayName,
+                        signalStrength = UNKNOWN_SIGNAL_STRENGTH,
+                        status = DirectPeerStatus.Discovered,
+                        isVerified = true
+                    )
+                )
+            }
+        }
+    }
+
     private companion object {
         const val MAX_TEXT_LENGTH = 2_000
         const val UNKNOWN_SIGNAL_STRENGTH = -127
         const val MESSAGE_TTL_MILLIS = 24 * 60 * 60 * 1_000L
         const val ACK_TTL_MILLIS = 60 * 60 * 1_000L
         const val MAX_SESSION_HISTORY = 4
+        const val DOP_LINK_PREFIX = "dop:"
     }
 }
 

@@ -410,12 +410,63 @@ Beta packet types:
 - MediaAccept
 - MediaReject
 - MediaChunk
+- MediaFragment
 - MediaChunkAcknowledgement
 - MediaComplete
+- GroupInvite
+- GroupMessage
+- BroadcastMessage
+- DopInitiation
 
 The media packet types are the Phase 1 protocol foundation for offline
 photo, video, and audio transfer. Full media storage, transfer scheduling,
 chunk persistence, UI, and resume behavior are implemented in later phases.
+
+## 15A. DOP-Handshake (Decentralized Offline Pre-Key Handshake, `DOP-v1`)
+
+`DOP-Handshake` (`protocolId = "CRYPTO_MESH_DOP"`, `protocolVersion = 1`) enables two devices to establish an authenticated, forward-secret AES-256-GCM session when the recipient is offline at session-initiation time, no Internet or central key-distribution server exists, and the recipient's signed pre-key bundle is obtained from local persistence or via opportunistic BLE relay (`DopPreKeySync`).
+
+### 15A.1 Cryptographic Roles and Separation
+
+1. **Long-Term Identity Signing Key ($IK_{sig}$):**
+   - Curve: NIST P-256 (`secp256r1`), algorithm `SHA256withECDSA`, stored in `AndroidKeyStore` (`cryptomesh.identity.signing`).
+   - Hardware backing is opportunistic and chipset-dependent (`KeyGenParameterSpec` does not force `setIsStrongBoxBacked(true)` so devices without StrongBox remain compatible).
+   - Used exclusively for signing/verifying `HandshakeHello`, `DopPreKeyRecord`, `DopInitiationWirePayload`, and `SecurePacketEnvelope`. Never used for ECDH.
+2. **Signed Epoch Pre-Key ($SPK_B$):**
+   - Recipient-generated P-256 ECDH key pair bound to a monotonically increasing `epochId` and validity window (`DEFAULT_RECORD_TTL_MILLIS = 7 days`, `PREVIOUS_EPOCH_RETENTION_MILLIS = 48 hours`).
+   - Private key bytes are wrapped at rest using `DopKeyWrappingService` (`AndroidKeyStoreWrappingService` with AES-256-GCM master key `cryptomesh.dop.storage.aes` in production; `SoftwareKeyWrappingService` in JVM tests) with AAD `CryptoMesh-DOP-KeyWrap-v1|<preKeyId>|<epochId>|<preKeyType>`.
+3. **Optional One-Time Pre-Keys ($OPK_{B,i}$):**
+   - Recipient-generated P-256 ECDH key pairs bundled inside `DopPreKeyRecord` (`DEFAULT_ONE_TIME_PREKEY_COUNT = 4`, `MAX_ONE_TIME_PREKEYS_PER_RECORD = 8`).
+   - Because decentralized BLE relays may distribute the same cached `DopPreKeyRecord` to multiple offline senders before the recipient comes online, `OPK`s transition through `ACTIVE -> CONSUMED_GRACE -> RETIRED` (`OPK_COALESCING_GRACE_MILLIS = 24 hours`, `MAX_CONCURRENT_OPK_USES = 4`), after which the wrapped private key is permanently wiped (`wrappedPrivateKeyBase64 = null`).
+4. **Sender Ephemeral Initiation Key ($EK_A$):**
+   - Fresh single-use P-256 ECDH key pair generated per offline session initiation along with a 32-byte `SecureRandom` nonce $N_A$; private key $ek_A$ is zeroed immediately after key derivation.
+
+### 15A.2 Transcript Binding and Domain-Separated Key Derivation
+
+Both sender $A$ and recipient $B$ construct the canonical length-prefixed transcript (`DopHandshakeTranscript`):
+$$H_{tr} = \text{SHA-256}(\text{LP}(\text{"CryptoMesh-DOP-v1-Transcript"}) \parallel \text{LP}(ID_A) \parallel \dots \parallel \text{LP}(N_A))$$
+- **Session Identifier:** `sessionId = "DOP-S1-" + HexUpper(H_tr[0..15])`
+- **ECDH Shared Secret Input ($IKM$):**
+  - With OPK: $IKM = \text{0x02} \parallel Z_1 \parallel Z_2$, where $Z_1 = \text{ECDH}(ek_A, SPK_B)$ and $Z_2 = \text{ECDH}(ek_A, OPK_{B,k})$.
+  - Without OPK (SPK-only): $IKM = \text{0x01} \parallel Z_1$.
+- **HKDF-SHA256 Derivation (`DopSessionKeyDerivation`):**
+  - $\text{Salt} = \text{SHA-256}(\text{"CryptoMesh-DOP-v1-Salt"} \parallel H_{tr} \parallel N_A)$
+  - $\text{Info} = \text{"CryptoMesh-DOP-v1-Keys|"} \parallel \text{sessionId} \parallel \text{"|"} \parallel ID_A \parallel \text{"|"} \parallel ID_B \parallel \text{"|"} \parallel \text{recordId} \parallel \text{"|"} \parallel \text{epochId}$
+  - $OKM = \text{HKDF-Expand}(\text{HKDF-Extract}(\text{Salt}, IKM), \text{Info}, 64)$
+  - $K_{sess} = OKM[0..31]$ (32-byte AES-256-GCM session key), $K_{conf} = OKM[32..63]$ (32-byte HMAC-SHA256 confirmation key).
+
+### 15A.3 Opportunistic Relay Pre-Key Sync and Validation
+
+- Upon completing a direct link authentication (`AuthenticatedHandshake`), peers exchange `DirectWireKind.DopPreKeySync` messages managed by `DopRelayCacheManager`.
+- Every incoming `DopPreKeyRecord` is validated by `DopPreKeyValidator` before caching: protocol ID/version, algorithm suite, P-256 curve validation, `deviceIdForPublicKey(recipientSigningPublicKey) == recipientDeviceId`, SHA-256 fingerprint match, clock-skew-tolerant validity window ($\pm 10\text{ min}$), and ECDSA signature verification over `UnsignedDopPreKeyRecord`.
+- Conflict resolution is deterministic: identical digest $\rightarrow$ ignore duplicate; higher `epochId` with same identity key $\rightarrow$ replace older epoch; lower `epochId` $\rightarrow$ ignore stale epoch; same `epochId` with different digest $\rightarrow$ reject conflict.
+- Relay cache is bounded (`DEFAULT_MAX_RELAY_CACHE_RECORDS = 64`, `MAX_RECORDS_PER_BLE_SYNC = 6`) with LRU eviction of non-own records and per-link digest tracking.
+
+### 15A.4 Asynchronous Initiation, Queued Packet Reprocessing, and Confirmation Tag
+
+- When sending text, media, or group invites to an offline peer with no active direct session, `BleDirectMeshRepository` invokes `DopHandshakeCoordinator.createInitiationForOfflineRecipient`, sealing the inner payload with $K_{sess}$ and AAD `"CryptoMesh-DOP-v1-InnerAAD|" + H_tr + "|" + sessionId + "|" + packetId`, and wrapping the signed `DopInitiationWirePayload` inside an outer `SecurePacketEnvelope(packetType = DopInitiation)`.
+- `flushPacketsForLink` prioritizes `SecurePacketType.DopInitiation` ahead of follow-up `Message`/`MediaOffer`/`MediaChunk` packets. If a follow-up packet arrives at the recipient before `DopInitiation`, it stays queued in `SecurePacketRepository` and is automatically reprocessed by `reprocessQueuedPacketsForSender` immediately after `DopInitiation` completes.
+- Upon completing `DopInitiation`, the recipient computes $\text{confirmTag} = \text{HMAC-SHA256}(K_{conf}, \text{"CryptoMesh-DOP-v1-Confirm|"} \parallel \text{sessionId} \parallel H_{tr} \parallel \text{packetId} \parallel ID_B)$ and embeds `dopSessionId` and `dopConfirmationTagBase64` inside the encrypted `DirectAcknowledgementPayload`. When the sender receives the ACK, `confirmSessionFromAcknowledgement` verifies the tag and transitions the persisted DOP session to `CONFIRMED`.
 
 ### 15.1 Sealing
 
@@ -497,13 +548,21 @@ Database:
 cryptomesh.db
 ```
 
-Room schema version: `1`
+Room schema version: `4`
 
-Exported schema:
+Exported schemas:
 
 ```text
 app/schemas/com.cryptomesh.frontend.data.local.CryptoMeshDatabase/1.json
+app/schemas/com.cryptomesh.frontend.data.local.CryptoMeshDatabase/2.json
+app/schemas/com.cryptomesh.frontend.data.local.CryptoMeshDatabase/3.json
+app/schemas/com.cryptomesh.frontend.data.local.CryptoMeshDatabase/4.json
 ```
+
+Explicit Room migrations:
+- `MIGRATION_1_2`: Adds `media_transfers` and `media_chunks`.
+- `MIGRATION_2_3`: Adds `mesh_groups`.
+- `MIGRATION_3_4`: Adds DOP-Handshake persistence tables (`dop_local_prekeys`, `dop_cached_prekey_records`, `dop_sessions`, `dop_replay_log`) and indices without altering existing tables.
 
 ### 17.1 `local_identity`
 
@@ -521,6 +580,13 @@ Indexes:
 
 Packet insertion uses `OnConflictStrategy.IGNORE` with packet UUID as primary
 key, providing local duplicate rejection.
+
+### 17.2A DOP-Handshake Tables (`MIGRATION_3_4`)
+
+- `dop_local_prekeys`: Stores local signed epoch pre-keys and one-time pre-keys with wrapped private key ciphertext (`wrappedPrivateKeyBase64`), `lifecycleState` (`ACTIVE`, `CONSUMED_GRACE`, `RETIRED`, `EXPIRED`), `usageCount`, and `expiresAtEpochMillis`.
+- `dop_cached_prekey_records`: Stores verified public `DopPreKeyRecord` bundles (both own and relay-cached third-party records), indexed by `epochId`, `expiresAtEpochMillis`, `lastAccessedAtEpochMillis`, and `recordDigestHex`.
+- `dop_sessions`: Stores wrapped AES-256-GCM session keys and HMAC-SHA256 confirmation keys bound to `transcriptHashHex` and `initiationPacketId` so offline sessions survive process restarts.
+- `dop_replay_log`: Stores seen initiation `(sessionId, senderDeviceId, senderNonceBase64)` tuples to coalesce multi-relay duplicate deliveries and reject mutated replay attacks.
 
 ### 17.3 Backup policy
 

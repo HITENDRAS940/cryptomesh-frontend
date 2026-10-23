@@ -24,11 +24,12 @@ For the UI layer, transfers are now treated as conversation timeline items rathe
 | UI Screens | `ui/screens/*` | Render user-facing screens and collect direct user actions. |
 | UI State | `ui/state/*` | Own screen state, view models, and UI-facing command methods. |
 | Design System | `ui/components/*`, `ui/theme/*` | Provide reusable UI primitives and app styling. |
-| Identity and Crypto | `crypto/*`, selected `protocol/*` | Manage local identity keys, signatures, handshakes, and packet encryption. |
-| Wire Protocol | `protocol/*` | Define offline packet envelopes, secure packet codecs, and media transfer payloads. |
+| Identity and Crypto | `crypto/*`, selected `protocol/*` | Manage local identity keys, key wrapping (`DopKeyWrappingService`), signatures, handshakes, and packet encryption. |
+| Wire Protocol | `protocol/*`, `protocol/dop/*` | Define offline packet envelopes, secure packet codecs, media transfer payloads, and `DOP-Handshake` (`DOP-v1`) pre-key records, transcripts, and session initiation messages. |
+| Relay Cache | `relay/DopRelayCacheManager.kt` | Validate, deduplicate, bound, and opportunistically synchronize signed `DopPreKeyRecord` bundles across untrusted BLE relays. |
 | BLE Transport | `transport/*` | Discover nearby devices and move framed bytes over Bluetooth Low Energy. |
-| Persistence | `data/local/*` | Store local identity, secure packets, media transfers, and media chunks. |
-| Domain Repositories | `data/repository/*` | Coordinate identity, packet storage, BLE sessions, relay behavior, and media transfer state. |
+| Persistence | `data/local/*` | Store local identity, secure packets, media transfers, media chunks, groups, and DOP pre-key/session/replay state (Room schema v4, `MIGRATION_3_4`). |
+| Domain Repositories | `data/repository/*` | Coordinate identity, packet storage, DOP pre-key lifecycle (`DopPreKeyRepository`), BLE sessions, relay behavior, and media transfer state. |
 | Notifications | `notification/*` | Convert repository state changes into local Android notifications. |
 | Tests | `app/src/test/java/com/cryptomesh/frontend/*` | Validate protocol, repository, state, notification, and frame behavior. |
 

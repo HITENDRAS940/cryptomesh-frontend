@@ -15,7 +15,8 @@ enum class SecurePacketType {
     MediaComplete,
     GroupInvite,
     GroupMessage,
-    BroadcastMessage
+    BroadcastMessage,
+    DopInitiation
 }
 
 @Serializable

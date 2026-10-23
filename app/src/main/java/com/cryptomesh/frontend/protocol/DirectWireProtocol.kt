@@ -1,5 +1,6 @@
 package com.cryptomesh.frontend.protocol
 
+import com.cryptomesh.frontend.protocol.dop.DopPreKeySyncMessage
 import java.util.Base64
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.encodeToString
@@ -8,7 +9,8 @@ import kotlinx.serialization.json.Json
 @Serializable
 enum class DirectWireKind {
     Handshake,
-    SecurePacket
+    SecurePacket,
+    DopPreKeySync
 }
 
 @Serializable
@@ -31,7 +33,9 @@ data class DirectTextPayload(
 @Serializable
 data class DirectAcknowledgementPayload(
     val acknowledgedPacketId: String,
-    val receivedAtEpochMillis: Long
+    val receivedAtEpochMillis: Long,
+    val dopSessionId: String? = null,
+    val dopConfirmationTagBase64: String? = null
 )
 
 @Serializable
@@ -84,6 +88,13 @@ class DirectWireCodec {
         )
     }
 
+    fun encodeDopPreKeySync(syncMessage: DopPreKeySyncMessage): ByteArray {
+        return encode(
+            DirectWireKind.DopPreKeySync,
+            json.encodeToString(syncMessage).encodeToByteArray()
+        )
+    }
+
     fun decode(encoded: ByteArray): DecodedDirectWireMessage {
         val envelope = json.decodeFromString<DirectWireEnvelope>(
             encoded.decodeToString()
@@ -100,6 +111,10 @@ class DirectWireCodec {
             )
 
             DirectWireKind.SecurePacket -> DecodedDirectWireMessage.Packet(
+                json.decodeFromString(payload.decodeToString())
+            )
+
+            DirectWireKind.DopPreKeySync -> DecodedDirectWireMessage.DopPreKeySync(
                 json.decodeFromString(payload.decodeToString())
             )
         }
@@ -226,5 +241,9 @@ sealed interface DecodedDirectWireMessage {
 
     data class Packet(
         val envelope: SecurePacketEnvelope
+    ) : DecodedDirectWireMessage
+
+    data class DopPreKeySync(
+        val syncMessage: DopPreKeySyncMessage
     ) : DecodedDirectWireMessage
 }

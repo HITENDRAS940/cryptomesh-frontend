@@ -145,6 +145,83 @@ class SecurePacketCodec(
     companion object {
         const val CURRENT_PROTOCOL_VERSION = 1
         private const val NONCE_SIZE_BYTES = 16
+        private val companionJson = Json {
+            encodeDefaults = true
+            ignoreUnknownKeys = false
+        }
+
+        fun sealDopInitiation(
+            packetId: String,
+            senderId: String,
+            receiverId: String,
+            initiationWireBytes: ByteArray,
+            signatureService: PacketSignatureService,
+            now: () -> Long = System::currentTimeMillis,
+            expiresAtEpochMillis: Long? = null,
+            nonceBytes: ByteArray = ByteArray(NONCE_SIZE_BYTES).also(SecureRandom()::nextBytes)
+        ): SecurePacketEnvelope {
+            require(senderId.isNotBlank()) { "Sender ID is required." }
+            require(receiverId.isNotBlank()) { "Receiver ID is required." }
+            require(initiationWireBytes.isNotEmpty()) { "DOP initiation payload cannot be empty." }
+
+            val header = PacketHeader(
+                protocolVersion = CURRENT_PROTOCOL_VERSION,
+                packetId = packetId,
+                packetType = SecurePacketType.DopInitiation,
+                senderId = senderId,
+                receiverId = receiverId,
+                createdAtEpochMillis = now(),
+                expiresAtEpochMillis = expiresAtEpochMillis,
+                nonceBase64 = nonceBytes.toBase64()
+            )
+            val unsignedPacket = UnsignedSecurePacket(
+                header = header,
+                payloadHashBase64 = sha256(initiationWireBytes).toBase64(),
+                encryptedPayloadBase64 = initiationWireBytes.toBase64()
+            )
+            val signatureInput = companionJson.encodeToString(unsignedPacket)
+                .encodeToByteArray()
+            val signature = signatureService.sign(signatureInput).toBase64()
+            return unsignedPacket.toEnvelope(signatureBase64 = signature)
+        }
+
+        fun openDopInitiationOuter(
+            envelope: SecurePacketEnvelope,
+            senderPublicKeyBytes: ByteArray,
+            signatureService: PacketSignatureService,
+            now: () -> Long = System::currentTimeMillis
+        ): Result<ByteArray> = runCatching {
+            require(envelope.protocolVersion == CURRENT_PROTOCOL_VERSION) {
+                "Unsupported protocol version ${envelope.protocolVersion}."
+            }
+            require(envelope.packetType == SecurePacketType.DopInitiation) {
+                "Expected DopInitiation packet type."
+            }
+            require(
+                envelope.expiresAtEpochMillis == null ||
+                    envelope.expiresAtEpochMillis > now()
+            ) {
+                "DOP initiation packet has expired."
+            }
+            val unsignedPacket = envelope.toUnsigned()
+            val signatureInput = companionJson.encodeToString(unsignedPacket)
+                .encodeToByteArray()
+            val signatureValid = signatureService.verify(
+                data = signatureInput,
+                signature = envelope.signatureBase64.fromBase64(),
+                publicKeyBytes = senderPublicKeyBytes
+            )
+            require(signatureValid) {
+                "Outer DOP initiation packet signature verification failed."
+            }
+            val wireBytes = envelope.encryptedPayloadBase64.fromBase64()
+            val actualHash = sha256(wireBytes)
+            val expectedHash = envelope.payloadHashBase64.fromBase64()
+            require(MessageDigest.isEqual(actualHash, expectedHash)) {
+                "Outer DOP initiation payload hash verification failed."
+            }
+            wireBytes
+        }
     }
 }
 
